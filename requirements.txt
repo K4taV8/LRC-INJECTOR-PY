@@ -1,0 +1,4 @@
+requests>=2.28
+rapidfuzz>=3.0
+mutagen>=1.46
+sv-ttk>=2.6

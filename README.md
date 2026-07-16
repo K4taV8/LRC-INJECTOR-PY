@@ -1,4 +1,4 @@
-# ` 🎤 `︲LRC Injector — Synchronisation automatique de paroles pour bibliothèques FLAC
+# ` 🎤 `︲LRC Injector : Synchronisation automatique de paroles pour bibliothèques FLAC
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white&style=for-the-badge">
@@ -40,7 +40,7 @@
 > [!NOTE]
 > **Problème résolu :** de nombreux fichiers `FLAC` n'embarquent aucune parole, ou seulement une version non synchronisée. Retrouver et coller manuellement un `.lrc` par piste n'est pas envisageable sur une bibliothèque de plusieurs milliers de titres.
 >
-> **Objectif :** automatiser entièrement ce travail — recherche, validation, injection et vérification — sur l'ensemble d'une discothèque, en parallélisant les requêtes et en évitant de re-interroger l'API pour des titres déjà traités.
+> **Objectif :** automatiser entièrement ce travail (recherche, validation, injection et vérification) sur l'ensemble d'une discothèque, en parallélisant les requêtes et en évitant de re-interroger l'API pour des titres déjà traités.
 
 Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbis Comment :
 
@@ -62,25 +62,25 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 > - ` 💉 ` **START** ︲ Injection des paroles manquantes sur un dossier ou un fichier `.flac`.
 > - ` 🔍 ` **CHECK** ︲ Audit + réparation automatique des tags déjà présents mais incomplets.
 
-* ` 🌐 `︲**Récupération via l'API LRCLIB** — requête directe (`artist`/`track`/`album`), puis repli automatique sur l'endpoint de recherche avec plusieurs variantes de requête (nom exact, titre seul, version translittérée ASCII) si la première tentative échoue.
+* ` 🌐 `︲**Récupération via l'API LRCLIB** : requête directe (`artist`/`track`/`album`), puis repli automatique sur l'endpoint de recherche avec plusieurs variantes de requête (nom exact, titre seul, version translittérée ASCII) si la première tentative échoue.
 
-* ` 🧠 `︲**Validation par similarité floue** (`rapidfuzz`) — les résultats renvoyés par l'API sont comparés à l'artiste et au titre du fichier local (seuil `85%`) avant injection, pour écarter les faux positifs.
+* ` 🧠 `︲**Validation par similarité floue** (`rapidfuzz`) : les résultats renvoyés par l'API sont comparés à l'artiste et au titre du fichier local (seuil `85%`) avant injection, pour écarter les faux positifs.
 
-* ` 🎼 `︲**Double injection synchronisée/brute** — chaque piste traitée reçoit à la fois `LYRICS` (avec timestamps) et `UNSYNCEDLYRICS` (timestamps supprimés), générées à partir de la même source.
+* ` 🎼 `︲**Double injection synchronisée/brute** : chaque piste traitée reçoit à la fois `LYRICS` (avec timestamps) et `UNSYNCEDLYRICS` (timestamps supprimés), générées à partir de la même source.
 
-* ` 🎹 `︲**Détection des morceaux instrumentaux** — via le flag `instrumental` renvoyé par l'API ou la présence du mot « instrumental » dans le titre. Ces pistes sont explicitement ignorées plutôt que traitées comme des échecs.
+* ` 🎹 `︲**Détection des morceaux instrumentaux** : via le flag `instrumental` renvoyé par l'API ou la présence du mot « instrumental » dans le titre. Ces pistes sont explicitement ignorées plutôt que traitées comme des échecs.
 
-* ` 🩹 `︲**Mode CHECK réparateur** — si un fichier possède `LYRICS` mais pas `UNSYNCEDLYRICS` (ou l'inverse), l'outil régénère le tag manquant sans reformuler de requête réseau quand c'est possible (dérivation locale par suppression des timestamps).
+* ` 🩹 `︲**Mode CHECK réparateur** : si un fichier possède `LYRICS` mais pas `UNSYNCEDLYRICS` (ou l'inverse), l'outil régénère le tag manquant sans reformuler de requête réseau quand c'est possible (dérivation locale par suppression des timestamps).
 
-* ` 💾 `︲**Cache local persistant** (`lrc_cache.json`) — chaque couple artiste/titre déjà résolu (trouvé, introuvable ou instrumental) est mis en cache pour éviter de re-solliciter l'API lors des passages suivants. Écriture périodique (tous les 200 changements) + à la fermeture.
+* ` 💾 `︲**Cache local persistant** (`lrc_cache.json`) : chaque couple artiste/titre déjà résolu (trouvé, introuvable ou instrumental) est mis en cache pour éviter de re-solliciter l'API lors des passages suivants. Écriture périodique (tous les 200 changements) + à la fermeture.
 
-* ` ⚙️ `︲**Traitement multithread** — `ThreadPoolExecutor` avec un nombre de threads réglable depuis l'interface (1 à 32 en injection, 1 à 16 en vérification).
+* ` ⚙️ `︲**Traitement multithread** : `ThreadPoolExecutor` avec un nombre de threads réglable depuis l'interface (1 à 32 en injection, 1 à 16 en vérification).
 
-* ` 🔁 `︲**Requêtes HTTP résilientes** — session `requests` mutualisée avec stratégie de retry (2 tentatives, backoff exponentiel) sur les codes `429`, `500`, `502`, `503`.
+* ` 🔁 `︲**Requêtes HTTP résilientes** : session `requests` mutualisée avec stratégie de retry (2 tentatives, backoff exponentiel) sur les codes `429`, `500`, `502`, `503`.
 
-* ` ⏹️ `︲**Annulation propre** — un bouton `STOP` interrompt le lot en cours (`threading.Event`), sans corrompre le cache ni laisser de threads orphelins.
+* ` ⏹️ `︲**Annulation propre** : un bouton `STOP` interrompt le lot en cours (`threading.Event`), sans corrompre le cache ni laisser de threads orphelins.
 
-* ` 🖥️ `︲**Interface sombre native** — thème `sv-ttk`, log coloré par statut (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), barre de progression déterminée/indéterminée selon la phase.
+* ` 🖥️ `︲**Interface sombre native** : thème `sv-ttk`, log coloré par statut (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), barre de progression déterminée/indéterminée selon la phase.
 
 ---
 
@@ -90,7 +90,7 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 ---
 
 > [!IMPORTANT]
-> **Captures d'écran à ajouter.** Aucune image n'a été fournie pour ce projet — cette section est un emplacement réservé (`placeholder`) à compléter avant publication.
+> **Captures d'écran à ajouter.** Aucune image n'a été fournie pour ce projet : cette section est un emplacement réservé (`placeholder`) à compléter avant publication.
 
 <details>
   <summary>📸︲Interface principale (à ajouter).</summary>
@@ -120,7 +120,7 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 
 1️⃣︲**Prérequis.**
 
-* ` 🐍 `︲**Python** `3.10+` recommandé *(version minimale non testée formellement — à valider)*.
+* ` 🐍 `︲**Python** `3.10+` recommandé *(version minimale non testée formellement, à valider)*.
 * ` 📦 `︲**pip** à jour.
 
 ---
@@ -133,7 +133,7 @@ cd <NOM_DU_DOSSIER_A_COMPLETER>
 ```
 
 > [!IMPORTANT]
-> **Aucun fichier `requirements.txt` n'a été fourni.** Les dépendances ci-dessous sont déduites directement des imports du script — à formaliser dans un `requirements.txt` dédié.
+> **Aucun fichier `requirements.txt` n'a été fourni.** Les dépendances ci-dessous sont déduites directement des imports du script, à formaliser dans un `requirements.txt` dédié.
 
 ---
 
@@ -162,14 +162,14 @@ python lrc-inject.py
 
 1️⃣︲**Sélectionner une source.**
 
-* ` 📁 ` ︲**Folder** — traite récursivement tous les `.flac` du dossier (et sous-dossiers).
-* ` 📄 ` ︲**File** — traite un unique fichier `.flac`.
+* ` 📁 ` ︲**Folder** : traite récursivement tous les `.flac` du dossier (et sous-dossiers).
+* ` 📄 ` ︲**File** : traite un unique fichier `.flac`.
 
 ---
 
 2️⃣︲**Ajuster le nombre de threads (optionnel).**
 
-Champ `Threads` — nombre de requêtes/traitements parallèles. Valeur par défaut : `min(CPU x 2, 16)`.
+Champ `Threads` : nombre de requêtes/traitements parallèles. Valeur par défaut : `min(CPU x 2, 16)`.
 
 ---
 
@@ -203,7 +203,7 @@ Un récapitulatif chiffré (`STATS`) s'affiche en fin de traitement.
 
 5️⃣︲**Vider le cache si nécessaire.**
 
-Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d'un état propre. Utile après un changement de source de vérité sur les métadonnées.
+Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'un état propre. Utile après un changement de source de vérité sur les métadonnées.
 
 ---
 
@@ -215,9 +215,9 @@ Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d
 > [!NOTE]
 > Le projet ne comporte pas de fichier de configuration externe : les seuls réglages disponibles sont ceux exposés dans l'interface.
 
-* ` 🧵 `︲**Threads** — champ numérique dans l'interface (borné automatiquement à 1–32 selon le mode).
-* ` 💾 `︲**Cache** — fichier `lrc_cache.json`, généré automatiquement à côté du script. Aucune option de chemin personnalisé actuellement.
-* ` 🎯 `︲**Seuil de similarité** — fixé en dur à `85%` (`rapidfuzz.fuzz.ratio`) dans le code source, non exposé dans l'interface.
+* ` 🧵 `︲**Threads** : champ numérique dans l'interface (borné automatiquement à 1–32 selon le mode).
+* ` 💾 `︲**Cache** : fichier `lrc_cache.json`, généré automatiquement à côté du script. Aucune option de chemin personnalisé actuellement.
+* ` 🎯 `︲**Seuil de similarité** : fixé en dur à `85%` (`rapidfuzz.fuzz.ratio`) dans le code source, non exposé dans l'interface.
 
 ---
 
@@ -227,7 +227,7 @@ Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d
 ---
 
 > [!IMPORTANT]
-> Le projet est actuellement constitué d'un **unique script** (`lrc-inject.py`), combinant logique métier et interface graphique. Aucune arborescence multi-modules n'a été fournie — à faire évoluer si le projet grandit.
+> Le projet est actuellement constitué d'un **unique script** (`lrc-inject.py`), combinant logique métier et interface graphique. Aucune arborescence multi-modules n'a été fournie, à faire évoluer si le projet grandit.
 
 | Bloc fonctionnel                     | Rôle                                                                 |
 |---------------------------------------|-----------------------------------------------------------------------|
@@ -248,17 +248,17 @@ Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d
 
 ---
 
-* ` 🧵 `︲**Parallélisation via `ThreadPoolExecutor`** — le traitement I/O-bound (requêtes réseau, lecture/écriture `FLAC`) tire parti du multithreading malgré le GIL, chaque tâche passant le plus clair de son temps en attente réseau/disque.
+* ` 🧵 `︲**Parallélisation via `ThreadPoolExecutor`** : le traitement I/O-bound (requêtes réseau, lecture/écriture `FLAC`) tire parti du multithreading malgré le GIL, chaque tâche passant le plus clair de son temps en attente réseau/disque.
 
-* ` 💾 `︲**Cache clé `artiste||titre`** — élimine les requêtes réseau redondantes sur des exécutions répétées ou de larges bibliothèques partiellement traitées.
+* ` 💾 `︲**Cache clé `artiste||titre`** : élimine les requêtes réseau redondantes sur des exécutions répétées ou de larges bibliothèques partiellement traitées.
 
-* ` 📉 `︲**Flush de cache par lot** (tous les 200 changements) plutôt qu'à chaque écriture — réduit les accès disque sur de gros volumes.
+* ` 📉 `︲**Flush de cache par lot** (tous les 200 changements) plutôt qu'à chaque écriture : réduit les accès disque sur de gros volumes.
 
-* ` 🪶 `︲**Rendu du log par lots** (`_flush_log`, throttlé à 150 ms, groupage des lignes de même statut) — évite de saturer la boucle Tkinter avec un `insert()` par ligne sur des traitements à haut débit.
+* ` 🪶 `︲**Rendu du log par lots** (`_flush_log`, throttlé à 150 ms, groupage des lignes de même statut) : évite de saturer la boucle Tkinter avec un `insert()` par ligne sur des traitements à haut débit.
 
-* ` 🧹 `︲**Purge du log affiché** au-delà de 3000 lignes — empêche la dégradation de l'interface sur les très longues sessions.
+* ` 🧹 `︲**Purge du log affiché** au-delà de 3000 lignes : empêche la dégradation de l'interface sur les très longues sessions.
 
-* ` 🔁 `︲**Retry HTTP borné** (2 tentatives, backoff `0.5s`) — tolère les erreurs transitoires de l'API sans bloquer indéfiniment un thread.
+* ` 🔁 `︲**Retry HTTP borné** (2 tentatives, backoff `0.5s`) : tolère les erreurs transitoires de l'API sans bloquer indéfiniment un thread.
 
 ---
 
@@ -267,14 +267,14 @@ Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d
 
 ---
 
-* ` 🐍 ` ︲**Python 3** — langage principal.
-* ` 🖼️ ` ︲**Tkinter** — interface graphique (bibliothèque standard).
-* ` 🎨 ` ︲**sv-ttk** — thème sombre pour `ttk`.
-* ` 🎧 ` ︲**mutagen** — lecture/écriture des tags `FLAC`.
-* ` 🔎 ` ︲**rapidfuzz** — comparaison floue de chaînes (validation artiste/titre).
-* ` 🌐 ` ︲**requests** + **urllib3** — appels HTTP vers l'API LRCLIB, avec gestion de retry.
-* ` 🎼 ` ︲**LRCLIB API** ︲[`🌐`](https://lrclib.net/) — source des paroles synchronisées.
-* ` 🧵 ` ︲**concurrent.futures (ThreadPoolExecutor)** — parallélisation des traitements.
+* ` 🐍 ` ︲**Python 3** : langage principal.
+* ` 🖼️ ` ︲**Tkinter** : interface graphique (bibliothèque standard).
+* ` 🎨 ` ︲**sv-ttk** : thème sombre pour `ttk`.
+* ` 🎧 ` ︲**mutagen** : lecture/écriture des tags `FLAC`.
+* ` 🔎 ` ︲**rapidfuzz** : comparaison floue de chaînes (validation artiste/titre).
+* ` 🌐 ` ︲**requests** + **urllib3** : appels HTTP vers l'API LRCLIB, avec gestion de retry.
+* ` 🎼 ` ︲**LRCLIB API** ︲[`🌐`](https://lrclib.net/) : source des paroles synchronisées.
+* ` 🧵 ` ︲**concurrent.futures (ThreadPoolExecutor)** : parallélisation des traitements.
 
 ---
 
@@ -300,7 +300,7 @@ Bouton `Clear Cache` (bas de fenêtre) — supprime `lrc_cache.json` et repart d
 ---
 
 > [!NOTE]
-> Aucune convention de contribution formelle n'a été définie pour ce projet — la marche à suivre ci-dessous est une base standard à adapter.
+> Aucune convention de contribution formelle n'a été définie pour ce projet : la marche à suivre ci-dessous est une base standard à adapter.
 
 1️⃣︲**Fork** du dépôt.
 

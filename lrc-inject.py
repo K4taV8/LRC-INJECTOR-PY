@@ -24,12 +24,30 @@ def get_session():
         adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry)
         SESSION.mount("https://", adapter)
     return SESSION
+
+_FLAC_CLS = None
+def get_flac_cls():
+    global _FLAC_CLS
+    if _FLAC_CLS is None:
+        from mutagen.flac import FLAC
+        _FLAC_CLS = FLAC
+    return _FLAC_CLS
+
+_FUZZ = None
+def get_fuzz():
+    global _FUZZ
+    if _FUZZ is None:
+        from rapidfuzz import fuzz
+        _FUZZ = fuzz
+    return _FUZZ
+
 TS_RE = re.compile(r"\[\d+:\d+\.\d+\]")
 CPU_COUNT = os.cpu_count() or 4
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lrc_cache.json")
 _cache = {}
 _cache_lock = Lock()
+_cache_dirty = False
 _dirty_count = 0
 _FLUSH_EVERY = 200
 
@@ -42,15 +60,20 @@ def _load_cache():
         _cache = {}
 
 def _save_cache():
+    global _cache_dirty
+    if not _cache_dirty:
+        return
     with _cache_lock:
         snapshot = dict(_cache)
+        _cache_dirty = False
     with open(CACHE_FILE, "w") as f:
-        json.dump(snapshot, f, indent=2)
+        json.dump(snapshot, f)
 
 def _mark_dirty():
-    global _dirty_count
+    global _dirty_count, _cache_dirty
     with _cache_lock:
         _dirty_count += 1
+        _cache_dirty = True
         flush = _dirty_count >= _FLUSH_EVERY
         if flush:
             _dirty_count = 0
@@ -169,8 +192,7 @@ def strip_timestamps(lrc):
     return "\n".join(TS_RE.sub("", line).strip() for line in lrc.splitlines()).strip()
 
 def match(a, b):
-    from rapidfuzz import fuzz
-    return fuzz.ratio(clean(a), clean(b)) > 85
+    return get_fuzz().ratio(clean(a), clean(b)) > 85
 
 SEARCH_API = "https://lrclib.net/api/search"
 
@@ -185,6 +207,7 @@ def _parse_result(data):
     return lrc, inst
 
 def _search_fallback(artist, title, key):
+    fuzz = get_fuzz()
     seen = set()
     ca, ct = clean(artist), clean(title)
     def fold(s):
@@ -248,7 +271,7 @@ def fetch_lrc(artist, title, album=""):
         return None, None, False
 
 def process_file(path):
-    from mutagen.flac import FLAC
+    FLAC = get_flac_cls()
     try:
         audio = FLAC(path)
         artist = audio.get("artist", [""])[0]
@@ -349,7 +372,7 @@ def start():
     threading.Thread(target=run, args=(p, workers), daemon=True).start()
 
 def check_one(path):
-    from mutagen.flac import FLAC
+    FLAC = get_flac_cls()
     try:
         audio = FLAC(path)
         name = audio.get("title", [""])[0] or os.path.basename(path)

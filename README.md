@@ -325,6 +325,6 @@ git checkout -b feature/ma-fonctionnalite
 ---
 
 > [!IMPORTANT]
-> **Aucune licence n'a été fournie avec ce projet.** À définir explicitement (ex. `MIT`, `GPL-3.0`, `Unlicense`) et à ajouter sous forme de fichier `LICENSE` à la racine du dépôt avant toute publication ou redistribution.
+> Projet distribué sous licence **MIT** voir le fichier `LICENSE` à la racine du dépôt.
 
 ---

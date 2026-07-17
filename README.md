@@ -98,7 +98,7 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 </details>
 
 <details>
-  <summary>📸︲Log en cours d'exécution (à ajouter).</summary>
+  <summary>📸︲Log en cours d'exécution.</summary>
   <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/77570347-53ee-47fe-b378-e553fbc937f1" />
   <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/f0844a9b-d523-4ad2-accc-0f5de67456ca" />
 </details>

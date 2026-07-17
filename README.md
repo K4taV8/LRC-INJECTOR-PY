@@ -93,17 +93,14 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 > **Captures d'écran à ajouter.** Aucune image n'a été fournie pour ce projet : cette section est un emplacement réservé (`placeholder`) à compléter avant publication.
 
 <details>
-  <summary>📸︲Interface principale (à ajouter).</summary>
-
-  `<!-- Insérer ici une capture de la fenêtre principale : champ Source, Threads, boutons START/STOP/CHECK -->`
-
+  <summary>📸︲Interface principale.</summary>
+  <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/804e95e9-93e6-4206-ba43-079405b7e342" />
 </details>
 
 <details>
   <summary>📸︲Log en cours d'exécution (à ajouter).</summary>
-
-  `<!-- Insérer ici une capture du log coloré pendant un traitement -->`
-
+  <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/77570347-53ee-47fe-b378-e553fbc937f1" />
+  <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/f0844a9b-d523-4ad2-accc-0f5de67456ca" />
 </details>
 
 ---
@@ -131,9 +128,6 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 git clone <URL_DU_DEPOT_A_COMPLETER>
 cd <NOM_DU_DOSSIER_A_COMPLETER>
 ```
-
-> [!IMPORTANT]
-> **Aucun fichier `requirements.txt` n'a été fourni.** Les dépendances ci-dessous sont déduites directement des imports du script, à formaliser dans un `requirements.txt` dédié.
 
 ---
 
@@ -286,11 +280,10 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 > [!NOTE]
 > Aucune feuille de route officielle n'a été fournie. Pistes d'évolution identifiées à partir du code actuel, à valider/prioriser :
 
-* ` 📄 `︲Ajout d'un `requirements.txt` formel.
-* ` ⚙️ `︲Exposition du seuil de similarité (`85%`) dans l'interface.
-* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`, `OGG`...).
-* ` 🧾 `︲Export du log en fichier (`.txt` / `.csv`).
-* ` 🧪 `︲Ajout de tests automatisés (aucun test n'existe actuellement dans le dépôt fourni).
+* ` ⚙️ `︲Exposition du seuil de similarité (`85%`) dans l'interface...
+* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`, `OGG`...)...
+* ` 🧾 `︲Export du log en fichier (`.txt` / `.csv`)...
+* ` 🧪 `︲Ajout de tests automatisés (aucun test n'existe actuellement dans le dépôt fourni)...
 
 ---
 

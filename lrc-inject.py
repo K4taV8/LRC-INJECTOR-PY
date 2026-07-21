@@ -226,7 +226,8 @@ def _search_fallback(artist, title, key):
                     lrc, inst = _parse_result(entry)
                     with _cache_lock:
                         _cache[key] = {"lrc": lrc, "inst": inst,
-                                       "a": entry.get("artistName"), "t": entry.get("trackName")}
+                                       "a": entry.get("artistName"), "t": entry.get("trackName"),
+                                       "no_sync": not lrc and not inst}
                     _mark_dirty()
                     return lrc, entry, inst
         except:
@@ -234,7 +235,7 @@ def _search_fallback(artist, title, key):
     return None, None, False
 
 def fetch_lrc(artist, title, album=""):
-    key = f"{artist.strip().lower()}||{title.strip().lower()}"
+    key = f"{artist.strip().lower()}||{title.strip().lower()}||{album.strip().lower()}"
     deleted = False
     with _cache_lock:
         if key in _cache:
@@ -243,6 +244,8 @@ def fetch_lrc(artist, title, album=""):
                 return c["lrc"], {"artistName": c["a"], "trackName": c["t"]}, c.get("inst", False)
             if c.get("inst"):
                 return None, None, True
+            if c.get("no_sync"):
+                return None, None, False
             del _cache[key]
             deleted = True
     if deleted:
@@ -262,6 +265,11 @@ def fetch_lrc(artist, title, album=""):
                                    "a": data.get("artistName"), "t": data.get("trackName")}
                 _mark_dirty()
                 return lrc, data, inst
+            with _cache_lock:
+                _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
+                               "a": data.get("artistName"), "t": data.get("trackName")}
+            _mark_dirty()
+            return None, None, False
 
         return _search_fallback(artist, title, key)
     except:
@@ -273,6 +281,8 @@ def fetch_lrc(artist, title, album=""):
 def process_file(path):
     FLAC = get_flac_cls()
     try:
+        if _cancel.is_set():
+            return ("skip", path, "annulé")
         audio = FLAC(path)
         artist = audio.get("artist", [""])[0]
         title = audio.get("title", [""])[0]
@@ -345,7 +355,7 @@ def run(folder, workers):
     log(f"\nInjection terminée sur {stats['ok']} fichier(s)")
     _save_cache()
     stop_pulse()
-    _set_busy(False)
+    root.after(0, lambda: _set_busy(False))
 
 
 def _set_busy(b):
@@ -365,7 +375,7 @@ def start():
         workers = max(1, min(32, int(thread_var.get())))
     except ValueError:
         workers = CPU_COUNT
-    if not p:
+    if not p or p == "Sélectionner un dossier ou fichier...":
         log("Select a folder or file")
         return
     _set_busy(True)
@@ -374,6 +384,8 @@ def start():
 def check_one(path):
     FLAC = get_flac_cls()
     try:
+        if _cancel.is_set():
+            return ("ok", f"[SKIP] {os.path.basename(path)} -> annulé")
         audio = FLAC(path)
         name = audio.get("title", [""])[0] or os.path.basename(path)
         has_l = "LYRICS" in audio
@@ -381,7 +393,7 @@ def check_one(path):
         if has_l and has_u:
             return ("ok", f"[OK] {name}")
         if has_l and not has_u:
-            audio["UNSYNCEDLYRICS"] = strip_timestamps(audio["LYRICS"])
+            audio["UNSYNCEDLYRICS"] = strip_timestamps(audio["LYRICS"][0])
             audio.save()
             return ("repair", f"[RÉPARÉ] {name} -> UNSYNCEDLYRICS ajouté")
         if has_u and not has_l:
@@ -389,13 +401,15 @@ def check_one(path):
             title = audio.get("title", [""])[0]
             if not artist or not title:
                 return ("partial", f"[PARTIEL] {name} -> pas d'artiste/titre")
-            lrc, _, inst = fetch_lrc(artist, title)
+            lrc, raw, inst = fetch_lrc(artist, title)
             if inst or re.search(r"instrumental", title, re.I):
                 return ("inst", f"[INST] {name} -> instrumental")
-            if lrc:
+            if lrc and match(artist, raw.get("artistName", "")) and match(title, raw.get("trackName", "")):
                 audio["LYRICS"] = lrc
                 audio.save()
                 return ("repair", f"[RÉPARÉ] {name} -> LYRICS ajouté")
+            if lrc:
+                return ("partial", f"[PARTIEL] {name} -> rejeté par similarité")
             return ("partial", f"[PARTIEL] {name} -> introuvable sur l'API")
         return ("missing", f"[MANQUE] {name} -> aucun tag")
     except Exception as e:
@@ -436,7 +450,7 @@ def check_files(folder):
     fixed = sum(1 for t, _ in lines if t == "repair")
     _save_cache()
     stop_pulse()
-    _set_busy(False)
+    root.after(0, lambda: _set_busy(False))
     if cancelled:
         log("[STOP] Vérification interrompue")
     log(f"Vérification de {total} fichier(s) :\n")
@@ -458,12 +472,16 @@ def clear_cache():
     log("[CACHE vidé]")
 
 def on_close():
+    _cancel.set()
     _save_cache()
     root.destroy()
 
 def start_check():
     _cancel.clear()
     p = folder_var.get()
+    if not p or p == "Sélectionner un dossier ou fichier...":
+        log("Select a folder or file")
+        return
     _set_busy(True)
     threading.Thread(target=check_files, args=(p,), daemon=True).start()
 

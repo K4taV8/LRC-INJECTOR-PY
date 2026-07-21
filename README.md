@@ -172,7 +172,7 @@ Champ `Threads` : nombre de requêtes/traitements parallèles. Valeur par défau
 | Bouton  | Action                                                                 |
 |---------|-------------------------------------------------------------------------|
 | `START` | Injecte les paroles manquantes sur les fichiers sans tag `LYRICS`/`UNSYNCEDLYRICS`. |
-| `CHECK` | Audite les fichiers déjà tagués et répare les tags incomplets.        |
+| `CHECK & REPAIR` | Audite les fichiers déjà tagués et répare les tags incomplets.        |
 | `STOP`  | Interrompt le traitement en cours.                                     |
 
 ---
@@ -244,7 +244,7 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 
 * ` 🧵 `︲**Parallélisation via `ThreadPoolExecutor`** : le traitement I/O-bound (requêtes réseau, lecture/écriture `FLAC`) tire parti du multithreading malgré le GIL, chaque tâche passant le plus clair de son temps en attente réseau/disque.
 
-* ` 💾 `︲**Cache clé `artiste||titre`** : élimine les requêtes réseau redondantes sur des exécutions répétées ou de larges bibliothèques partiellement traitées.
+* ` 💾 `︲**Cache clé `artiste\x00titre\x00album`** : élimine les requêtes réseau redondantes sur des exécutions répétées ou de larges bibliothèques partiellement traitées. Séparateur `\x00` (impossible dans les métadonnées musicales, évite les collisions).
 
 * ` 📉 `︲**Flush de cache par lot** (tous les 200 changements) plutôt qu'à chaque écriture : réduit les accès disque sur de gros volumes.
 
@@ -253,6 +253,27 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 * ` 🧹 `︲**Purge du log affiché** au-delà de 3000 lignes : empêche la dégradation de l'interface sur les très longues sessions.
 
 * ` 🔁 `︲**Retry HTTP borné** (2 tentatives, backoff `0.5s`) : tolère les erreurs transitoires de l'API sans bloquer indéfiniment un thread.
+
+---
+
+
+
+---
+
+<a id="choices"></a>
+# `⚖️`︲Choix techniques & limitations.
+
+> L'outil a subi **10 audits consécutifs** et **36 bugs corrigés** avant d'atteindre ce niveau de maturité. Les choix ci-dessous sont délibérés et documentés pour éviter les faux positifs lors de futures relectures.
+
+| Choix | Justification |
+|-------|--------------|
+| **Écriture FLAC in-place** (`audio.save()` sans fichier temp) | mutagen 1.46+ ne supporte pas `save(tmp)` vers un fichier neuf — il vérifie le header FLAC du fichier de sortie, ce qui échoue sur un fichier vide. `save()` in-place modifie uniquement les métadonnées au début du fichier (tags Vorbis), sans toucher aux données audio. En cas de crash pendant l'écriture, seuls les tags peuvent être corrompus ; l'audio reste jouable. |
+| **`except Exception` généralisés** | Application GUI : un crash silencieux avec message dans le log est préférable à un traceback non géré qui ferme la fenêtre. Chaque erreur est loggée avec son contexte. |
+| **Monolithe (pas de séparation core/gui)** | 760 lignes, un seul script. Le coût d'un refactor multi-modules dépasserait le bénéfice pour ce périmètre. |
+| **`daemon=True` sur les workers** | Le `join(timeout=30)` dans `on_close()` laisse le temps de finir. Si le timeout expire, l'écriture in-place garantit que l'audio n'est pas perdu (seuls les tags peuvent être tronqués). |
+| **Cache sans TTL** | Les entrées `no_sync` et `inst` sont permanentes. L'utilisateur dispose d'un bouton `Clear Cache` pour repartir de zéro si nécessaire. |
+| **Pas de rate limiting explicite** | LRCLIB accepte les requêtes concurrentes ; un retry avec backoff est configuré sur les codes 429. |
+| **`_save_flac(audio, path)` ignore `path`** | Signature conservée pour compatibilité. `audio.save()` utilise toujours le chemin interne du fichier. |
 
 ---
 

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import tempfile
 import unicodedata
 import threading
 
@@ -8,7 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
-import sv_ttk
+try:
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
 
 LRCLIB_API = "https://lrclib.net/api/get"
 SESSION = None
@@ -19,9 +23,13 @@ def get_session():
         import requests
         from urllib3.util.retry import Retry
         SESSION = requests.Session()
-        retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503],
-                      allowed_methods=["GET"])
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry)
+        try:
+            retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503],
+                          allowed_methods=["GET"])
+        except TypeError:
+            retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503],
+                          method_whitelist=["GET"])
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=retry)
         SESSION.mount("https://", adapter)
     return SESSION
 
@@ -41,7 +49,24 @@ def get_fuzz():
         _FUZZ = fuzz
     return _FUZZ
 
-TS_RE = re.compile(r"\[\d+:\d+\.\d+\]")
+MATCH_THRESHOLD = 85
+
+def _first_tag(audio, key, default=""):
+    val = audio.get(key)
+    if val is None or len(val) == 0:
+        return default
+    return val[0]
+
+def _save_flac(audio, path):
+    try:
+        audio.save()
+        return True
+    except Exception as e:
+        log(f"[ERROR] _save_flac échec: {e}")
+        return False
+
+TS_RE = re.compile(r"\[\d+:\d+(?:\.\d+)?\]|<\d+:\d+\.\d+>")
+META_RE = re.compile(r"^\[.*\]$")
 CPU_COUNT = os.cpu_count() or 4
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lrc_cache.json")
@@ -54,20 +79,27 @@ _FLUSH_EVERY = 200
 def _load_cache():
     global _cache
     try:
-        with open(CACHE_FILE, "r") as f:
-            _cache = json.load(f)
-    except:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _cache = data if isinstance(data, dict) else {}
+    except Exception:
         _cache = {}
 
 def _save_cache():
     global _cache_dirty
-    if not _cache_dirty:
-        return
     with _cache_lock:
+        if not _cache_dirty:
+            return
         snapshot = dict(_cache)
-        _cache_dirty = False
-    with open(CACHE_FILE, "w") as f:
-        json.dump(snapshot, f)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f)
+            os.replace(tmp, CACHE_FILE)
+            _cache_dirty = False
+        except:
+            os.unlink(tmp)
+            raise
 
 def _mark_dirty():
     global _dirty_count, _cache_dirty
@@ -88,14 +120,14 @@ _log_pending = False
 _log_lines = 0
 
 def _tag_for(msg):
-    if msg.startswith("[OK]") or "already has lyrics" in msg or "[RÉPARÉ]" in msg:
+    if msg.startswith("[SKIP]") or msg.startswith("[MANQUE]"):
+        return "skip"
+    if msg.startswith("[OK]") or "[RÉPARÉ]" in msg:
         return "ok"
     if msg.startswith("[MISS]") or msg.startswith("[REJECT]") or msg.startswith("[PARTIEL]"):
         return "warn"
     if msg.startswith("[ERROR]") or msg.startswith("[ERREUR]"):
         return "error"
-    if msg.startswith("[SKIP]") or msg.startswith("[MANQUE]"):
-        return "skip"
     if msg.startswith("[INST]"):
         return "inst"
     return None
@@ -114,27 +146,32 @@ def _flush_log():
         msgs = _log_buffer[:]
         _log_buffer.clear()
         _log_pending = bool(_log_buffer)
+        schedule = _log_pending
     if msgs:
         tag = _tag_for(msgs[0])
         start = 0
         for i, m in enumerate(msgs):
             t = _tag_for(m)
             if t != tag:
-                text_box.insert(tk.END, "\n".join(msgs[start:i]) + "\n", tag if tag else ())
+                text = "\n".join(msgs[start:i]) + "\n"
+                text_box.insert(tk.END, text, tag if tag else ())
+                _log_lines += text.count("\n")
                 tag = t
                 start = i
-        text_box.insert(tk.END, "\n".join(msgs[start:]) + "\n", tag if tag else ())
+        text = "\n".join(msgs[start:]) + "\n"
+        text_box.insert(tk.END, text, tag if tag else ())
+        _log_lines += text.count("\n")
         text_box.see(tk.END)
-        _log_lines += len(msgs)
         if _log_lines > 3000:
-            text_box.delete("1.0", "1000.0")
-            _log_lines -= 1000
-    if _log_pending:
+            deleted = min(1000, _log_lines)
+            text_box.delete("1.0", f"{deleted + 1}.0")
+            _log_lines -= deleted
+    if schedule:
         root.after(150, _flush_log)
 
 _pulsing = False
-_spin_id = None
 _cancel = threading.Event()
+_worker_thread = None
 
 def start_pulse():
     global _pulsing
@@ -145,11 +182,8 @@ def start_pulse():
     ))
 
 def stop_pulse():
-    global _pulsing, _spin_id
+    global _pulsing
     _pulsing = False
-    if _spin_id:
-        root.after_cancel(_spin_id)
-        _spin_id = None
     root.after(0, lambda: (
         progress.stop(),
         progress.config(mode="determinate", value=0, maximum=100),
@@ -160,15 +194,12 @@ def stop_pulse():
 _last_prog = 0
 
 def update_progress(val, maxv):
-    global _pulsing, _spin_id, _last_prog
+    global _pulsing, _last_prog
     step = max(1, maxv // 200) if maxv else 1
     if val - _last_prog < step and val != maxv:
         return
     _last_prog = val
     if _pulsing:
-        if _spin_id:
-            root.after_cancel(_spin_id)
-            _spin_id = None
         root.after(0, lambda: (
             progress.stop(),
             progress.config(mode="determinate"),
@@ -189,10 +220,15 @@ def clean(t):
     return t.strip()
 
 def strip_timestamps(lrc):
-    return "\n".join(TS_RE.sub("", line).strip() for line in lrc.splitlines()).strip()
+    lines = []
+    for line in lrc.splitlines():
+        line = TS_RE.sub("", line).strip()
+        if line and not META_RE.match(line):
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 def match(a, b):
-    return get_fuzz().ratio(clean(a), clean(b)) > 85
+    return get_fuzz().ratio(clean(a), clean(b)) >= MATCH_THRESHOLD
 
 SEARCH_API = "https://lrclib.net/api/search"
 
@@ -203,7 +239,7 @@ def _parse_result(data):
         lrc = "\n".join(lrc)
     if isinstance(pl, list):
         pl = "\n".join(pl)
-    inst = data.get("instrumental", False) or (not lrc and not pl) or (pl and pl.strip().lower() == "instrumental")
+    inst = data.get("instrumental", False) or (pl and pl.strip().lower() == "instrumental")
     return lrc, inst
 
 def _search_fallback(artist, title, key):
@@ -213,6 +249,7 @@ def _search_fallback(artist, title, key):
     def fold(s):
         return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode()
     queries = [f"{artist} {title}", title, f"{fold(artist)} {fold(title)}"]
+    best = None
     for q in queries:
         if q in seen:
             continue
@@ -222,26 +259,44 @@ def _search_fallback(artist, title, key):
             if s.status_code != 200:
                 continue
             for entry in s.json():
-                if fuzz.ratio(ca, clean(entry.get("artistName", ""))) > 85 and fuzz.ratio(ct, clean(entry.get("trackName", ""))) > 85:
+                if fuzz.ratio(ca, clean(entry.get("artistName", ""))) >= MATCH_THRESHOLD and fuzz.ratio(ct, clean(entry.get("trackName", ""))) >= MATCH_THRESHOLD:
                     lrc, inst = _parse_result(entry)
-                    with _cache_lock:
-                        _cache[key] = {"lrc": lrc, "inst": inst,
-                                       "a": entry.get("artistName"), "t": entry.get("trackName"),
-                                       "no_sync": not lrc and not inst}
-                    _mark_dirty()
-                    return lrc, entry, inst
-        except:
+                    if lrc and (not best or not best[0]):
+                        best = (lrc, entry, inst)
+                    if lrc and not inst:
+                        with _cache_lock:
+                            _cache[key] = {"lrc": lrc, "inst": inst,
+                                           "a": entry.get("artistName"), "t": entry.get("trackName"),
+                                           "pl": entry.get("plainLyrics")}
+                        _mark_dirty()
+                        return lrc, entry, inst
+                    if not best:
+                        best = (lrc, entry, inst)
+        except Exception:
             continue
+    if best:
+        lrc, entry, inst = best
+        with _cache_lock:
+            _cache[key] = {"lrc": lrc, "inst": inst,
+                           "a": entry.get("artistName"), "t": entry.get("trackName"),
+                           "pl": entry.get("plainLyrics"),
+                           "no_sync": not lrc and not inst}
+        _mark_dirty()
+        return best
+    with _cache_lock:
+        _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
+                       "pl": None}
+    _mark_dirty()
     return None, None, False
 
 def fetch_lrc(artist, title, album=""):
-    key = f"{artist.strip().lower()}||{title.strip().lower()}||{album.strip().lower()}"
+    key = f"{artist.strip().lower()}\x00{title.strip().lower()}\x00{album.strip().lower()}"
     deleted = False
     with _cache_lock:
         if key in _cache:
             c = _cache[key]
             if c.get("lrc"):
-                return c["lrc"], {"artistName": c["a"], "trackName": c["t"]}, c.get("inst", False)
+                return c["lrc"], {"artistName": c["a"], "trackName": c["t"], "plainLyrics": c.get("pl")}, c.get("inst", False)
             if c.get("inst"):
                 return None, None, True
             if c.get("no_sync"):
@@ -262,17 +317,19 @@ def fetch_lrc(artist, title, album=""):
             if lrc or inst:
                 with _cache_lock:
                     _cache[key] = {"lrc": lrc, "inst": inst,
-                                   "a": data.get("artistName"), "t": data.get("trackName")}
+                                   "a": data.get("artistName"), "t": data.get("trackName"),
+                                   "pl": data.get("plainLyrics")}
                 _mark_dirty()
                 return lrc, data, inst
             with _cache_lock:
                 _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
-                               "a": data.get("artistName"), "t": data.get("trackName")}
+                               "a": data.get("artistName"), "t": data.get("trackName"),
+                               "pl": data.get("plainLyrics")}
             _mark_dirty()
-            return None, None, False
+            return None, data, False
 
         return _search_fallback(artist, title, key)
-    except:
+    except Exception:
         lrc, data, inst = _search_fallback(artist, title, key)
         if lrc or inst:
             return lrc, data, inst
@@ -284,78 +341,101 @@ def process_file(path):
         if _cancel.is_set():
             return ("skip", path, "annulé")
         audio = FLAC(path)
-        artist = audio.get("artist", [""])[0]
-        title = audio.get("title", [""])[0]
-        album = audio.get("album", [""])[0]
+        artist = _first_tag(audio, "artist")
+        title = _first_tag(audio, "title")
+        album = _first_tag(audio, "album")
 
         if not artist or not title:
             return ("skip", path, None)
 
-        if audio.get("LYRICS") or audio.get("UNSYNCEDLYRICS"):
+        if _first_tag(audio, "LYRICS").strip() or _first_tag(audio, "UNSYNCEDLYRICS").strip():
             return ("skip", title, "already has lyrics")
 
         lrc, raw, inst = fetch_lrc(artist, title, album)
         if inst or re.search(r"instrumental", title, re.I):
             return ("inst", title, None)
         if not lrc:
+            if raw and raw.get("plainLyrics"):
+                if not match(artist, raw.get("artistName", "")) or not match(title, raw.get("trackName", "")):
+                    return ("reject", title, None)
+                audio["UNSYNCEDLYRICS"] = raw["plainLyrics"]
+                if not _save_flac(audio, path):
+                    return ("error", title, "cannot write file (corrupted?)")
+                return ("ok", title, "plain lyrics")
             return ("miss", title, None)
         if not match(artist, raw.get("artistName", "")) or not match(title, raw.get("trackName", "")):
             return ("reject", title, None)
 
         audio["LYRICS"] = lrc
-        audio["UNSYNCEDLYRICS"] = strip_timestamps(lrc)
-        audio.save()
+        unsynced = strip_timestamps(lrc)
+        if unsynced:
+            audio["UNSYNCEDLYRICS"] = unsynced
+        if not _save_flac(audio, path):
+            k = f"{artist.strip().lower()}\x00{title.strip().lower()}\x00{album.strip().lower()}"
+            with _cache_lock:
+                _cache.pop(k, None)
+            _mark_dirty()
+            return ("error", title, "cannot write file (corrupted?)")
         return ("ok", title, None)
     except Exception as e:
         return ("error", path, str(e))
 
 def run(folder, workers):
+    global _last_prog
     _cancel.clear()
+    _last_prog = 0
     start_pulse()
-    if os.path.isfile(folder):
-        files = [folder]
-    else:
-        files = [
-            os.path.join(r, f)
-            for r, _, fs in os.walk(folder)
-            for f in fs if f.lower().endswith(".flac")
-        ]
-    stats = {"ok":0,"miss":0,"reject":0,"skip":0,"error":0,"inst":0}
-    total = len(files)
-    log(f"Files: {total} | Threads: {workers}")
+    try:
+        if os.path.isfile(folder):
+            files = [folder]
+        else:
+            files = []
+            for r, _, fs in os.walk(folder, onerror=lambda e: log(f"[ERROR] {e.filename} -> {e.strerror}")):
+                for f in fs:
+                    if f.lower().endswith(".flac"):
+                        files.append(os.path.join(r, f))
+        stats = {"ok":0,"miss":0,"reject":0,"skip":0,"error":0,"inst":0}
+        total = len(files)
+        if not files and os.path.isdir(folder):
+            log("[WARN] No .flac files found in the specified path")
+        log(f"Files: {total} | Threads: {workers}")
 
-    cancelled = False
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(process_file, f) for f in files]
-        for i, fu in enumerate(as_completed(futures), 1):
-            if _cancel.is_set():
-                for f in futures:
-                    f.cancel()
-                cancelled = True
-                break
-            status, name, extra = fu.result()
-            stats[status] += 1
-            if status == "ok":
-                log(f"[OK] {name}")
-            elif status == "inst":
-                log(f"[INST] {name}")
-            elif status == "miss":
-                log(f"[MISS] {name}")
-            elif status == "reject":
-                log(f"[REJECT] {name}")
-            elif status == "skip":
-                log(f"[SKIP] {name}" + (f" -> {extra}" if extra else ""))
-            else:
-                log(f"[ERROR] {name} -> {extra}")
-            update_progress(i, total)
+        cancelled = False
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(process_file, f) for f in files]
+            for i, fu in enumerate(as_completed(futures), 1):
+                if _cancel.is_set():
+                    for f in futures:
+                        f.cancel()
+                    cancelled = True
+                    break
+                status, name, extra = fu.result()
+                stats[status] += 1
+                if status == "ok":
+                    log(f"[OK] {name}" + (f" -> {extra}" if extra else ""))
+                elif status == "inst":
+                    log(f"[INST] {name}")
+                elif status == "miss":
+                    log(f"[MISS] {name}")
+                elif status == "reject":
+                    log(f"[REJECT] {name}")
+                elif status == "skip":
+                    log(f"[SKIP] {name}" + (f" -> {extra}" if extra else ""))
+                else:
+                    log(f"[ERROR] {name} -> {extra}")
+                update_progress(i, total)
 
-    log("\n=== STATS ===")
-    for k, v in stats.items():
-        log(f"{k.upper()}: {v}")
-    log(f"\nInjection terminée sur {stats['ok']} fichier(s)")
-    _save_cache()
-    stop_pulse()
-    root.after(0, lambda: _set_busy(False))
+        log("\n=== STATS ===")
+        for k, v in stats.items():
+            log(f"{k.upper()}: {v}")
+        log(f"\nInjection terminée : {stats['ok']}/{total} fichier(s)")
+    finally:
+        try:
+            _save_cache()
+        except Exception as e:
+            log(f"[ERROR] Cache save failed: {e}")
+        stop_pulse()
+        root.after(0, lambda: _set_busy(False))
 
 
 def _set_busy(b):
@@ -363,12 +443,17 @@ def _set_busy(b):
     start_btn.config(state=state)
     check_btn.config(state=state)
     stop_btn.config(state="normal" if b else "disabled")
+    clear_cache_btn.config(state=state)
 
 def stop_processing():
     _cancel.set()
     log("[STOP] Annulation en cours...")
 
 def start():
+    global _worker_thread
+    if _worker_thread and _worker_thread.is_alive():
+        log("[ERROR] A treatment is already in progress")
+        return
     _cancel.clear()
     p = folder_var.get()
     try:
@@ -378,8 +463,12 @@ def start():
     if not p or p == "Sélectionner un dossier ou fichier...":
         log("Select a folder or file")
         return
+    if not os.path.exists(p):
+        log("Path does not exist")
+        return
     _set_busy(True)
-    threading.Thread(target=run, args=(p, workers), daemon=True).start()
+    _worker_thread = threading.Thread(target=run, args=(p, workers), daemon=True)
+    _worker_thread.start()
 
 def check_one(path):
     FLAC = get_flac_cls()
@@ -387,26 +476,32 @@ def check_one(path):
         if _cancel.is_set():
             return ("ok", f"[SKIP] {os.path.basename(path)} -> annulé")
         audio = FLAC(path)
-        name = audio.get("title", [""])[0] or os.path.basename(path)
-        has_l = "LYRICS" in audio
-        has_u = "UNSYNCEDLYRICS" in audio
+        name = _first_tag(audio, "title") or os.path.basename(path)
+        has_l = bool(_first_tag(audio, "LYRICS").strip())
+        has_u = bool(_first_tag(audio, "UNSYNCEDLYRICS").strip())
         if has_l and has_u:
             return ("ok", f"[OK] {name}")
         if has_l and not has_u:
-            audio["UNSYNCEDLYRICS"] = strip_timestamps(audio["LYRICS"][0])
-            audio.save()
-            return ("repair", f"[RÉPARÉ] {name} -> UNSYNCEDLYRICS ajouté")
+            unsynced = strip_timestamps(_first_tag(audio, "LYRICS"))
+            if unsynced:
+                audio["UNSYNCEDLYRICS"] = unsynced
+                if not _save_flac(audio, path):
+                    return ("error", f"[ERREUR] {name} -> cannot write file")
+                return ("repair", f"[RÉPARÉ] {name} -> UNSYNCEDLYRICS ajouté")
+            return ("ok", f"[OK] {name}")
         if has_u and not has_l:
-            artist = audio.get("artist", [""])[0]
-            title = audio.get("title", [""])[0]
+            artist = _first_tag(audio, "artist")
+            title = _first_tag(audio, "title")
             if not artist or not title:
                 return ("partial", f"[PARTIEL] {name} -> pas d'artiste/titre")
-            lrc, raw, inst = fetch_lrc(artist, title)
+            album = _first_tag(audio, "album")
+            lrc, raw, inst = fetch_lrc(artist, title, album)
             if inst or re.search(r"instrumental", title, re.I):
                 return ("inst", f"[INST] {name} -> instrumental")
             if lrc and match(artist, raw.get("artistName", "")) and match(title, raw.get("trackName", "")):
                 audio["LYRICS"] = lrc
-                audio.save()
+                if not _save_flac(audio, path):
+                    return ("error", f"[ERREUR] {name} -> cannot write file")
                 return ("repair", f"[RÉPARÉ] {name} -> LYRICS ajouté")
             if lrc:
                 return ("partial", f"[PARTIEL] {name} -> rejeté par similarité")
@@ -416,50 +511,60 @@ def check_one(path):
         return ("error", f"[ERREUR] {os.path.basename(path)} -> {e}")
 
 def check_files(folder):
+    global _last_prog
     _cancel.clear()
+    _last_prog = 0
+    log("[INFO] CHECK & REPAIR mode: files will be modified (tags added/fixed)")
     start_pulse()
-    if os.path.isfile(folder):
-        files = [folder]
-    else:
-        files = [
-            os.path.join(r, f)
-            for r, _, fs in os.walk(folder)
-            for f in fs if f.lower().endswith(".flac")
-        ]
-    total = len(files)
-    lines = []
     try:
-        workers = max(1, min(16, int(thread_var.get())))
-    except ValueError:
-        workers = CPU_COUNT
-    cancelled = False
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(check_one, f) for f in files]
-        for i, fu in enumerate(as_completed(futures), 1):
-            if _cancel.is_set():
-                for f in futures:
-                    f.cancel()
-                cancelled = True
-                break
-            lines.append(fu.result())
-            update_progress(i, total)
+        if os.path.isfile(folder):
+            files = [folder]
+        else:
+            files = []
+            for r, _, fs in os.walk(folder, onerror=lambda e: log(f"[ERROR] {e.filename} -> {e.strerror}")):
+                for f in fs:
+                    if f.lower().endswith(".flac"):
+                        files.append(os.path.join(r, f))
+        total = len(files)
+        lines = []
+        try:
+            workers = max(1, min(16, int(thread_var.get())))
+        except ValueError:
+            workers = min(CPU_COUNT, 16)
+        cancelled = False
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(check_one, f) for f in files]
+            for i, fu in enumerate(as_completed(futures), 1):
+                if _cancel.is_set():
+                    for f in futures:
+                        f.cancel()
+                    cancelled = True
+                    break
+                lines.append(fu.result())
+                update_progress(i, total)
 
-    order = {"ok": 0, "repair": 1, "error": 2, "inst": 3, "partial": 4, "missing": 5}
-    lines.sort(key=lambda x: order.get(x[0], 9))
-    ok = sum(1 for t, _ in lines if t == "ok")
-    fixed = sum(1 for t, _ in lines if t == "repair")
-    _save_cache()
-    stop_pulse()
-    root.after(0, lambda: _set_busy(False))
-    if cancelled:
-        log("[STOP] Vérification interrompue")
-    log(f"Vérification de {total} fichier(s) :\n")
-    for _, msg in lines:
-        log(msg)
-    log(f"\n{ok}/{total} complets, {fixed} réparé(s)")
+        order = {"ok": 0, "repair": 1, "error": 2, "inst": 3, "partial": 4, "missing": 5}
+        lines.sort(key=lambda x: order.get(x[0], 9))
+        ok = sum(1 for t, _ in lines if t == "ok")
+        fixed = sum(1 for t, _ in lines if t == "repair")
+        if cancelled:
+            log("[STOP] Vérification interrompue")
+        log(f"Vérification de {total} fichier(s) :\n")
+        for _, msg in lines:
+            log(msg)
+        log(f"\n{ok}/{total} complets, {fixed} réparé(s)")
+    finally:
+        try:
+            _save_cache()
+        except Exception as e:
+            log(f"[ERROR] Cache save failed: {e}")
+        stop_pulse()
+        root.after(0, lambda: _set_busy(False))
 
 def clear_log():
+    global _log_lines
     text_box.delete("1.0", tk.END)
+    _log_lines = 0
 
 def clear_cache():
     global _cache
@@ -467,23 +572,37 @@ def clear_cache():
         _cache = {}
         try:
             os.remove(CACHE_FILE)
-        except:
+        except Exception:
             pass
     log("[CACHE vidé]")
 
 def on_close():
+    global _worker_thread
     _cancel.set()
-    _save_cache()
+    if _worker_thread and _worker_thread.is_alive():
+        _worker_thread.join(timeout=30)
+    try:
+        _save_cache()
+    except Exception:
+        pass
     root.destroy()
 
 def start_check():
+    global _worker_thread
+    if _worker_thread and _worker_thread.is_alive():
+        log("[ERROR] A treatment is already in progress")
+        return
     _cancel.clear()
     p = folder_var.get()
     if not p or p == "Sélectionner un dossier ou fichier...":
         log("Select a folder or file")
         return
+    if not os.path.exists(p):
+        log("Path does not exist")
+        return
     _set_busy(True)
-    threading.Thread(target=check_files, args=(p,), daemon=True).start()
+    _worker_thread = threading.Thread(target=check_files, args=(p,), daemon=True)
+    _worker_thread.start()
 
 def pick():
     folder_var.set(filedialog.askdirectory())
@@ -497,7 +616,7 @@ def pick_file():
 try:
     from ctypes import windll
     windll.shcore.SetProcessDpiAwareness(1)
-except:
+except Exception:
     pass
 
 # ── Barre de titre Windows sombre ──
@@ -510,7 +629,7 @@ def _force_dark_titlebar(win):
         windll.dwmapi.DwmSetWindowAttribute(
             HWND, DWMWA_USE_IMMERSIVE_DARK_MODE, byref(value), sizeof(value)
         )
-    except:
+    except Exception:
         pass
 
 # ── Fenêtre ──
@@ -531,11 +650,12 @@ try:
     import tkinter.font as tkfont
     default_font = tkfont.nametofont("TkDefaultFont")
     default_font.configure(family="Segoe UI", size=9)
-except:
+except Exception:
     pass
 
 # ── Theme ──
-sv_ttk.set_theme("dark")
+if sv_ttk:
+    sv_ttk.set_theme("dark")
 style = ttk.Style()
 ACCENT = "#3b82f6"
 style.configure("Start.TButton", font=("Segoe UI", 10, "bold"), padding=(28, 10))
@@ -588,7 +708,7 @@ stop_btn = ttk.Button(btn_frame, text="STOP", command=stop_processing)
 stop_btn.pack(side=tk.LEFT, padx=6)
 stop_btn.config(state="disabled")
 
-check_btn = ttk.Button(btn_frame, text="CHECK", style="Check.TButton", command=start_check)
+check_btn = ttk.Button(btn_frame, text="CHECK & REPAIR", style="Check.TButton", command=start_check)
 check_btn.pack(side=tk.LEFT, padx=6)
 
 # ── Progress ──
@@ -634,7 +754,8 @@ status_bar = ttk.Frame(root)
 status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 status_label = ttk.Label(status_bar, text="Ready", font=("Segoe UI", 9))
 status_label.pack(side=tk.LEFT, padx=12)
-ttk.Button(status_bar, text="Clear Cache", command=clear_cache, style="Browse.TButton").pack(side=tk.RIGHT, padx=6)
+clear_cache_btn = ttk.Button(status_bar, text="Clear Cache", command=clear_cache, style="Browse.TButton")
+clear_cache_btn.pack(side=tk.RIGHT, padx=6)
 
 root.protocol("WM_DELETE_WINDOW", on_close)
 root.deiconify()

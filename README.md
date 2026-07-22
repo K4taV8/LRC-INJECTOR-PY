@@ -1,4 +1,4 @@
-# ` 🎤 `︲LRC Injector : Synchronisation automatique de paroles pour bibliothèques FLAC
+# ` 🎤 `︲LRC Injector : Synchronisation automatique de paroles pour bibliothèques .FLAC
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white&style=for-the-badge">
@@ -89,14 +89,12 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 # `🖼️`︲Aperçu.
 
 ---
-
-> [!IMPORTANT]
-> **Captures d'écran à ajouter.** Aucune image n'a été fournie pour ce projet : cette section est un emplacement réservé (`placeholder`) à compléter avant publication.
-
 <details>
   <summary>📸︲Interface principale.</summary>
   <img width="1220" height="987" alt="image" src="https://github.com/user-attachments/assets/804e95e9-93e6-4206-ba43-079405b7e342" />
 </details>
+
+---
 
 <details>
   <summary>📸︲Log en cours d'exécution.</summary>
@@ -266,10 +264,6 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 
 ---
 
-
-
----
-
 <a id="choices"></a>
 # `⚖️`︲Choix techniques & limitations.
 
@@ -304,17 +298,16 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 ---
 
 <a id="roadmap"></a>
-# `🗺️`︲Roadmap.
+# `🗺️`︲Roadmap ?
 
 ---
 
 > [!NOTE]
 > Aucune feuille de route officielle n'a été fournie. Pistes d'évolution identifiées à partir du code actuel, à valider/prioriser :
 
-* ` ⚙️ `︲Exposition du seuil de similarité (`85%`) dans l'interface...
-* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`, `OGG`...)...
-* ` 🧾 `︲Export du log en fichier (`.txt` / `.csv`)...
-* ` 🧪 `︲Ajout de tests automatisés (aucun test n'existe actuellement dans le dépôt fourni)...
+* ` ⚙️ `︲Exposition du seuil de similarité (`85%`) dans l'interface ?
+* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`, `OGG`...) ?
+* ` 🧾 `︲Export du log en fichier (`.txt` / `.csv`) ?
 
 ---
 
@@ -349,6 +342,6 @@ git checkout -b feature/ma-fonctionnalite
 ---
 
 > [!IMPORTANT]
-> Projet distribué sous licence **MIT** voir le fichier `LICENSE` à la racine du dépôt.
+> Projet distribué sous licence **MIT** voir le fichier `LICENSE` à la racine du dépôt !
 
 ---

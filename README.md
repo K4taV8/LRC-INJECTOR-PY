@@ -6,7 +6,8 @@
   <img src="https://img.shields.io/badge/FLAC-mutagen-4b0082?style=for-the-badge">
   <img src="https://img.shields.io/badge/LRCLIB-API-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/Threaded-ThreadPoolExecutor-critical?style=for-the-badge">
-  <img src="https://img.shields.io/badge/License-À_DÉFINIR-lightgrey?style=for-the-badge">
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge">
+  <img src="https://img.shields.io/badge/AI_Powered-DeepSeek_V4_|_Claude-8A2BE2?style=for-the-badge">
 </p>
 
 ---
@@ -154,6 +155,9 @@ python lrc-inject.py
 
 ---
 
+> [!CAUTION]
+> **Avant tout traitement de masse, faites une copie de sauvegarde de vos fichiers FLAC.** L'écriture in-place modifie les fichiers originaux (cf. [Choix techniques](#choix)). Le risque est très faible — fenêtre de quelques ms par fichier — mais en cas de crash au moment précis de l'écriture, les métadonnées voire l'audio peuvent être affectés. Une sauvegarde vous permet de revenir en arrière en toute sérénité.
+
 1️⃣︲**Sélectionner une source.**
 
 * ` 📁 ` ︲**Folder** : traite récursivement tous les `.flac` du dossier (et sous-dossiers).
@@ -242,7 +246,13 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 
 ---
 
-* ` 🧵 `︲**Parallélisation via `ThreadPoolExecutor`** : le traitement I/O-bound (requêtes réseau, lecture/écriture `FLAC`) tire parti du multithreading malgré le GIL, chaque tâche passant le plus clair de son temps en attente réseau/disque.
+> L'optimisation I/O est le cœur de la vitesse de l'outil. Chaque goulot d'étranglement disque a été traité :
+
+* ` ⚡ `︲**Écriture FLAC directe in-place** : pas de fichier temporaire, pas de `os.replace`. `audio.save()` écrit les tags directement en tête du fichier sans recopier les données audio ni double I/O. Résultat : une injection prend **quelques millisecondes** par fichier au lieu de plusieurs secondes avec une copie complète.
+
+* ` 🔓 `︲**Snapshot cache sans contention** : le verrou est libéré avant l'écriture disque du JSON. Les threads workers ne bloquent jamais sur un flush cache. Un mécanisme de version (`pending_count`) garantit qu'aucune entrée n'est perdue si le cache est modifié pendant l'I/O.
+
+* ` 🧵 `︲**Parallélisation via `ThreadPoolExecutor`** : le traitement I/O-bound (requêtes réseau, écriture FLAC) tire parti du multithreading malgré le GIL, chaque tâche passant l'essentiel de son temps en attente réseau/disque.
 
 * ` 💾 `︲**Cache clé `artiste\x00titre\x00album`** : élimine les requêtes réseau redondantes sur des exécutions répétées ou de larges bibliothèques partiellement traitées. Séparateur `\x00` (impossible dans les métadonnées musicales, évite les collisions).
 
@@ -263,14 +273,14 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 <a id="choices"></a>
 # `⚖️`︲Choix techniques & limitations.
 
-> L'outil a subi **10 audits consécutifs** et **36 bugs corrigés** avant d'atteindre ce niveau de maturité. Les choix ci-dessous sont délibérés et documentés pour éviter les faux positifs lors de futures relectures.
+> L'outil a subi **11 audits consécutifs** et **38 bugs corrigés** avant d'atteindre ce niveau de maturité. Les choix ci-dessous sont délibérés et documentés pour éviter les faux positifs lors de futures relectures.
 
 | Choix | Justification |
 |-------|--------------|
-| **Écriture FLAC in-place** (`audio.save()` sans fichier temp) | mutagen 1.46+ ne supporte pas `save(tmp)` vers un fichier neuf — il vérifie le header FLAC du fichier de sortie, ce qui échoue sur un fichier vide. `save()` in-place modifie uniquement les métadonnées au début du fichier (tags Vorbis), sans toucher aux données audio. En cas de crash pendant l'écriture, seuls les tags peuvent être corrompus ; l'audio reste jouable. |
+| **Écriture FLAC in-place** (`audio.save()` sans fichier temp) | mutagen 1.46+ ne supporte pas `save(tmp)` vers un fichier neuf — il vérifie le header FLAC du fichier de sortie, ce qui échoue sur un fichier vide. `save()` in-place écrit les nouveaux tags Vorbis en tête de fichier. Si le bloc Vorbis change de taille (cas systématique avec `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` décale physiquement les données audio sur le disque. Un crash/coupure *pendant ce décalage* peut tronquer l'audio et pas seulement les tags. Ce scénario est très improbable (fenêtre de quelques ms par fichier sur un lot de 189 fichiers, seuls les fichiers en cours d'écriture au moment précis du crash sont à risque), mais documenté pour transparence. Pour une sécurité maximale, sauvegardez votre bibliothèque avant un traitement de masse. |
 | **`except Exception` généralisés** | Application GUI : un crash silencieux avec message dans le log est préférable à un traceback non géré qui ferme la fenêtre. Chaque erreur est loggée avec son contexte. |
-| **Monolithe (pas de séparation core/gui)** | 760 lignes, un seul script. Le coût d'un refactor multi-modules dépasserait le bénéfice pour ce périmètre. |
-| **`daemon=True` sur les workers** | Le `join(timeout=30)` dans `on_close()` laisse le temps de finir. Si le timeout expire, l'écriture in-place garantit que l'audio n'est pas perdu (seuls les tags peuvent être tronqués). |
+| **Monolithe (pas de séparation core/gui)** | ~785 lignes, un seul script. Le coût d'un refactor multi-modules dépasserait le bénéfice pour ce périmètre. |
+| **`daemon=True` sur les workers** | Le `join(timeout=30)` dans `on_close()` laisse le temps de finir. Si le timeout expire, le thread est tué ; l'écriture in-place peut laisser un fichier en cours de décalage audio dans un état instable. Idéalement, attendre la fin du traitement avant de fermer l'application. |
 | **Cache sans TTL** | Les entrées `no_sync` et `inst` sont permanentes. L'utilisateur dispose d'un bouton `Clear Cache` pour repartir de zéro si nécessaire. |
 | **Pas de rate limiting explicite** | LRCLIB accepte les requêtes concurrentes ; un retry avec backoff est configuré sur les codes 429. |
 | **`_save_flac(audio, path)` ignore `path`** | Signature conservée pour compatibilité. `audio.save()` utilise toujours le chemin interne du fichier. |

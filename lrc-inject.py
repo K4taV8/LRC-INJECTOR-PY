@@ -86,20 +86,26 @@ def _load_cache():
         _cache = {}
 
 def _save_cache():
-    global _cache_dirty
+    global _cache_dirty, _dirty_count
     with _cache_lock:
         if not _cache_dirty:
             return
         snapshot = dict(_cache)
+        pending_count = _dirty_count
+    try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f)
             os.replace(tmp, CACHE_FILE)
-            _cache_dirty = False
+            with _cache_lock:
+                if _dirty_count == pending_count:
+                    _cache_dirty = False
         except:
             os.unlink(tmp)
             raise
+    except Exception as e:
+        log(f"[ERROR] Cache save failed: {e}")
 
 def _mark_dirty():
     global _dirty_count, _cache_dirty
@@ -134,14 +140,19 @@ def _tag_for(msg):
 
 def log(msg):
     global _log_pending
+    schedule = False
     with _log_lock:
         _log_buffer.append(msg)
         if not _log_pending:
             _log_pending = True
-            root.after(150, _flush_log)
+            schedule = True
+    if schedule and root.winfo_exists():
+        root.after(150, _flush_log)
 
 def _flush_log():
     global _log_pending, _log_lines
+    if not root.winfo_exists():
+        return
     with _log_lock:
         msgs = _log_buffer[:]
         _log_buffer.clear()
@@ -228,7 +239,13 @@ def strip_timestamps(lrc):
     return "\n".join(lines).strip()
 
 def match(a, b):
-    return get_fuzz().ratio(clean(a), clean(b)) >= MATCH_THRESHOLD
+    fuzz = get_fuzz()
+    ca, cb = clean(a), clean(b)
+    return (fuzz.ratio(ca, cb) >= MATCH_THRESHOLD or
+            fuzz.ratio(fold(ca), fold(cb)) >= MATCH_THRESHOLD)
+
+def fold(s):
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode()
 
 SEARCH_API = "https://lrclib.net/api/search"
 
@@ -246,8 +263,6 @@ def _search_fallback(artist, title, key):
     fuzz = get_fuzz()
     seen = set()
     ca, ct = clean(artist), clean(title)
-    def fold(s):
-        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode()
     queries = [f"{artist} {title}", title, f"{fold(artist)} {fold(title)}"]
     best = None
     for q in queries:
@@ -300,6 +315,8 @@ def fetch_lrc(artist, title, album=""):
             if c.get("inst"):
                 return None, None, True
             if c.get("no_sync"):
+                if c.get("pl"):
+                    return None, {"artistName": c.get("a"), "trackName": c.get("t"), "plainLyrics": c.get("pl")}, False
                 return None, None, False
             del _cache[key]
             deleted = True
@@ -346,7 +363,7 @@ def process_file(path):
         album = _first_tag(audio, "album")
 
         if not artist or not title:
-            return ("skip", path, None)
+            return ("skip", os.path.basename(path), None)
 
         if _first_tag(audio, "LYRICS").strip() or _first_tag(audio, "UNSYNCEDLYRICS").strip():
             return ("skip", title, "already has lyrics")
@@ -360,6 +377,10 @@ def process_file(path):
                     return ("reject", title, None)
                 audio["UNSYNCEDLYRICS"] = raw["plainLyrics"]
                 if not _save_flac(audio, path):
+                    k = f"{artist.strip().lower()}\x00{title.strip().lower()}\x00{album.strip().lower()}"
+                    with _cache_lock:
+                        _cache.pop(k, None)
+                    _mark_dirty()
                     return ("error", title, "cannot write file (corrupted?)")
                 return ("ok", title, "plain lyrics")
             return ("miss", title, None)
@@ -387,6 +408,9 @@ def run(folder, workers):
     start_pulse()
     try:
         if os.path.isfile(folder):
+            if not folder.lower().endswith(".flac"):
+                log(f"[SKIP] Not a .flac file: {os.path.basename(folder)}")
+                return
             files = [folder]
         else:
             files = []
@@ -488,7 +512,7 @@ def check_one(path):
                 if not _save_flac(audio, path):
                     return ("error", f"[ERREUR] {name} -> cannot write file")
                 return ("repair", f"[RÉPARÉ] {name} -> UNSYNCEDLYRICS ajouté")
-            return ("ok", f"[OK] {name}")
+            return ("partial", f"[PARTIEL] {name} -> pas de texte dans LYRICS")
         if has_u and not has_l:
             artist = _first_tag(audio, "artist")
             title = _first_tag(audio, "title")
@@ -518,6 +542,9 @@ def check_files(folder):
     start_pulse()
     try:
         if os.path.isfile(folder):
+            if not folder.lower().endswith(".flac"):
+                log(f"[SKIP] Not a .flac file: {os.path.basename(folder)}")
+                return
             files = [folder]
         else:
             files = []

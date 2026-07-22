@@ -154,7 +154,7 @@ python lrc-inject.py
 ---
 
 > [!CAUTION]
-> **Avant tout traitement de masse, faites une copie de sauvegarde de vos fichiers FLAC.** L'écriture in-place modifie les fichiers originaux (cf. [Choix techniques](#choix)). Le risque est très faible — fenêtre de quelques ms par fichier — mais en cas de crash au moment précis de l'écriture, les métadonnées voire l'audio peuvent être affectés. Une sauvegarde vous permet de revenir en arrière en toute sérénité.
+> **Avant tout traitement de masse, faites une copie de sauvegarde de vos fichiers FLAC.** L'écriture in-place modifie les fichiers originaux (cf. [Choix techniques](#choices)). Le risque est très faible — fenêtre de quelques ms par fichier — mais en cas de crash au moment précis de l'écriture, les métadonnées voire l'audio peuvent être affectés. Une sauvegarde vous permet de revenir en arrière en toute sérénité.
 
 1️⃣︲**Sélectionner une source.**
 

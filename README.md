@@ -306,7 +306,7 @@ Bouton `Clear Cache` (bas de fenêtre) : supprime `lrc_cache.json` et repart d'u
 > Aucune feuille de route officielle n'a été fournie. Pistes d'évolution identifiées à partir du code actuel, à valider/prioriser :
 
 * ` ⚙️ `︲Exposition du seuil de similarité (`85%`) dans l'interface ?
-* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`, `OGG`...) ?
+* ` 🗂️ `︲Support d'autres formats audio que `FLAC` (`MP3`...) ?
 * ` 🧾 `︲Export du log en fichier (`.txt` / `.csv`) ?
 
 ---

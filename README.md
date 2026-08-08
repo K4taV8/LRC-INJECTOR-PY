@@ -328,8 +328,6 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 <a id="choices"></a>
 # `⚖️`︲Choix techniques & limitations.
 
-> L'outil a subi **11 audits consécutifs** et **38 bugs corrigés** avant d'atteindre ce niveau de maturité. Les choix ci-dessous sont délibérés et documentés pour éviter les faux positifs lors de futures relectures.
-
 | Choix | Justification |
 |-------|--------------|
 | **Écriture FLAC in-place** (`audio.save()` sans fichier temp) | mutagen 1.46+ ne supporte pas `save(tmp)` vers un fichier neuf — il vérifie le header FLAC du fichier de sortie, ce qui échoue sur un fichier vide. `save()` in-place écrit les nouveaux tags Vorbis en tête de fichier. Si le bloc Vorbis change de taille (cas systématique avec `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` décale physiquement les données audio sur le disque. Un crash/coupure *pendant ce décalage* peut tronquer l'audio et pas seulement les tags. Ce scénario est très improbable (fenêtre de quelques ms par fichier sur un lot de 189 fichiers, seuls les fichiers en cours d'écriture au moment précis du crash sont à risque), mais documenté pour transparence. Pour une sécurité maximale, sauvegardez votre bibliothèque avant un traitement de masse. |

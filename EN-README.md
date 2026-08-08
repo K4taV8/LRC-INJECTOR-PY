@@ -329,8 +329,6 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 <a id="choices"></a>
 # `⚖️`︲Technical Choices & limitations.
 
-> The tool has undergone **11 consecutive audits** and **38 bugs fixed** before reaching this maturity level. The choices below are deliberate and documented to avoid false positives on future reviews.
-
 | Choice | Rationale |
 |--------|-----------|
 | **In-place FLAC writing** (`audio.save()` without temp file) | mutagen 1.46+ does not support `save(tmp)` to a new file — it checks the FLAC header of the output file, which fails on an empty one. In-place `save()` writes the new Vorbis tags at the head of the file. If the Vorbis block changes size (systematically the case with `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` physically shifts the audio data on disk. A crash/power loss *during this shift* can truncate the audio, not just the tags. This is very unlikely (a few-ms window per file), but documented for transparency. For maximum safety, back up your library before batch processing. |

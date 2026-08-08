@@ -94,18 +94,27 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 
 ---
 
-<details>
-  <summary>📸︲Interface principale.</summary>
-  <img width="1220" height="980" alt="image" src="https://github.com/user-attachments/assets/ca5f23f3-a2d4-4927-8688-b3f0042ada76" />
-</details>
-
----
-
-<details>
-  <summary>📸︲Log en cours d'exécution.</summary>
-  <img width="1220" height="980" alt="image" src="https://github.com/user-attachments/assets/4a687a0b-e159-405c-8354-f562b8e19592" />
-  <img width="1220" height="980" alt="image" src="https://github.com/user-attachments/assets/b3d258a6-5b8b-4785-8290-15ec2d66d8f4" />
-  <img width="1220" height="978" alt="image" src="https://github.com/user-attachments/assets/29edc5ae-2c61-4326-8f0d-c6a744f52714" />
+<details open>
+  <summary>📸︲Galerie d'interfaces et logs.</summary>
+  <br>
+  <table>
+    <tr>
+      <td width="50%">
+        <img src="https://github.com/user-attachments/assets/ca5f23f3-a2d4-4927-8688-b3f0042ada76" alt="Interface principale" width="100%" />
+      </td>
+      <td width="50%">
+        <img src="https://github.com/user-attachments/assets/4a687a0b-e159-405c-8354-f562b8e19592" alt="Log en cours d'exécution 1" width="100%" />
+      </td>
+    </tr>
+    <tr>
+      <td width="50%">
+        <img src="https://github.com/user-attachments/assets/b3d258a6-5b8b-4785-8290-15ec2d66d8f4" alt="Log en cours d'exécution 2" width="100%" />
+      </td>
+      <td width="50%">
+        <img src="https://github.com/user-attachments/assets/29edc5ae-2c61-4326-8f0d-c6a744f52714" alt="Log en cours d'exécution 3" width="100%" />
+      </td>
+    </tr>
+  </table>
 </details>
 
 ---

@@ -13,6 +13,10 @@
 
 ---
 
+Réalisé avec soin mais avec l'IA !
+
+---
+
 **LRC Injector** est un outil de bureau (CustomTkinter) qui parcourt une bibliothèque musicale au format `FLAC`, interroge l'API [LRCLIB](https://lrclib.net/) pour récupérer les paroles synchronisées de chaque piste, puis les injecte directement dans les tags du fichier (`LYRICS` et `UNSYNCEDLYRICS`). Un mode `CHECK` permet en plus d'auditer une bibliothèque existante et de réparer automatiquement les tags incomplets.
 
 ---

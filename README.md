@@ -13,7 +13,7 @@
 
 ---
 
-Réalisé avec soin mais avec l'IA !
+<p align="center">Réalisé avec soin mais avec l'IA !</p>
 
 ---
 

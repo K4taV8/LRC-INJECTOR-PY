@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/FLAC-mutagen-4b0082?style=for-the-badge">
   <img src="https://img.shields.io/badge/LRCLIB-API-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/Threaded-ThreadPoolExecutor-critical?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Mode_API-SPEED_%7C_COOL-8A2BE2?style=for-the-badge">
+  <img src="https://img.shields.io/badge/API_D%C3%A9bit-1_%E2%86%92_25_req%2Fs-8A2BE2?style=for-the-badge">
   <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge">
   <img src="https://img.shields.io/badge/AI_Powered-DeepSeek_V4_|_Claude-8A2BE2?style=for-the-badge">
 </p>
@@ -79,17 +79,21 @@ Le script cible spécifiquement le format `FLAC` et s'appuie sur deux tags Vorbi
 
 * ` 🩹 `︲**Mode CHECK réparateur** : si un fichier possède `LYRICS` mais pas `UNSYNCEDLYRICS` (ou l'inverse), l'outil régénère le tag manquant sans reformuler de requête réseau quand c'est possible (dérivation locale par suppression des timestamps).
 
-* ` 💾 `︲**Cache local persistant** (`lrc_cache.json`) : chaque couple artiste/titre déjà résolu (trouvé, introuvable ou instrumental) est mis en cache pour éviter de re-solliciter l'API lors des passages suivants. Écriture périodique (tous les 200 changements) + à la fermeture. Les entrées « introuvable » portent un **TTL de 30 jours** : une piste absente aujourd'hui sera re-tentée automatiquement dans un mois.
+* ` 💾 `︲**Cache local persistant** (`lrc_cache.json`) : chaque couple artiste/titre déjà résolu (trouvé, introuvable ou instrumental) est mis en cache pour éviter de re-solliciter l'API lors des passages suivants. Écriture périodique (tous les 200 changements) + à la fermeture. **Deux TTL distincts** : une piste *introuvable* (`404`) est re-tentée au bout de **3 jours** — LRCLIB récupère en arrière-plan les pistes manquantes, donc un refus n'est pas définitif — alors qu'une piste *trouvée mais sans paroles synchronisées* est conservée **30 jours**. Les réussites n'expirent jamais.
 
 * ` ⚙️ `︲**Traitement multithread** : `ThreadPoolExecutor` avec un nombre de threads réglable depuis l'interface (1 à 32 en injection, 1 à 16 en vérification).
 
-* ` 🔁 `︲**Requêtes HTTP résilientes** : session `requests` mutualisée (pool de 32 connexions) avec stratégie de retry (2 tentatives, backoff exponentiel) sur les codes `500`, `502`, `503` — le `429` (rate limit) est géré séparément via une pause coordonnée honorant `Retry-After`. Un **User-Agent nominatif** (`lrc-injector/1.2`) est envoyé sur chaque requête — exigence LRCLIB (403 sinon).
+* ` 🔁 `︲**Requêtes HTTP résilientes** : session `requests` mutualisée (pool de 32 connexions) avec stratégie de retry (2 tentatives, backoff exponentiel) sur les codes `500`, `502`, `503` — le `429` (rate limit) est géré séparément via une pause coordonnée honorant `Retry-After`. Un **User-Agent nominatif** (`lrc-injector/1.2`) est envoyé sur chaque requête — exigence LRCLIB (403 sinon). Une erreur transitoire (`429`, `5xx`) n'est **jamais** mise en cache, et un `400` (requête invalide) est signalé tel quel au lieu de déclencher un repli.
 
-* ` 🚦 `︲**Deux modes d'allure API (`SPEED` / `COOL`)** : SPEED *(défaut)* = rafales illimitées au débit maximum offert par vos threads ; COOL = débit lissé à ~10 requêtes/s (token bucket partagé). Dans les deux modes, `Retry-After` est obligatoirement honoré (exigence LRCLIB, sinon bannissement temporaire). Détails en [Configuration](#configuration).
+* ` 🚦 `︲**Débit API réglable (1 → 25 req/s)** : un unique mode lissé, plus de rafales illimitées. Un **token bucket partagé** (`RateLimiter`) lisse le débit quel que soit le nombre de threads, le plafond étant fixé par le curseur dans la carte Options (25 req/s par défaut). Si LRCLIB coupe (`429`/`503`), l'outil honore `Retry-After`, **divise le débit par deux** et le remonte progressivement après une série de succès — il ne peut jamais dépasser le curseur. Détails en [Configuration](#configuration).
 
 * ` ⏹️ `︲**Annulation propre** : un bouton `STOP` interrompt le lot en cours (`threading.Event`), sans corrompre le cache ni laisser de threads orphelins.
 
-* ` 🖥️ `︲**Interface sombre moderne** : `customtkinter` (palette sur mesure calquée sur une maquette HTML/CSS, cartes arrondies `Options`/`Log` avec marges internes, boutons colorés `START`/`STOP`/`SPEED`/`COOL`, case `Auto`), log coloré par statut (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), barre de progression lisse déterminée/indéterminée selon la phase. Rendu net sur écrans haute-DPI (DPI awareness forcée) et barre de titre Windows sombre native.
+* ` 🎨 `︲**Logo applicatif** (`Logo.png`) : affiché dans la barre de titre, dans la **barre des tâches** et dans l'en-tête en haut à gauche de la fenêtre. Un `AppUserModelID` explicite (`K4taV8.LRC-INJECTOR-PY`) est posé **avant** la création de la fenêtre : sans lui, Windows regroupe la fenêtre sur le chemin de l'exécutable et affiche l'icône de `python.exe` (le logo Py) au lieu de celle de la fenêtre. Fichier absent = l'application démarre quand même, avec l'icône par défaut.
+
+* ` 🖥️ `︲**Interface sombre moderne** : `customtkinter` (palette sur mesure calquée sur une maquette HTML/CSS, en-tête logo + nom de l'app, cartes arrondies `Options`/`Log` avec marges internes, boutons colorés `START`/`STOP`, curseur de débit, case `Auto`), log coloré par statut (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), barre de progression lisse déterminée/indéterminée selon la phase.
+
+* ` 📐 `︲**Fenêtredimensionnée en pixels réels** : l'ouverture vise **852 × 952 pixels**, quelle que soit la mise à l'échelle de l'écran. Tk applique le facteur DPI à la taille mais Windows interprète la *position* en pixels physiques — les deux sont donc convertis séparément (`opening_geometry()`), et la bordure du cadre est mesurée au lancement pour que la fenêtre soit centrée au pixel près. Rendu net sur écrans haute-DPI (DPI awareness forcée) et barre de titre Windows sombre native.
 
 ---
 
@@ -152,10 +156,10 @@ cd <NOM_DU_DOSSIER_A_COMPLETER>
 3️⃣︲**Installer les dépendances.**
 
 ```bash
-pip install requests rapidfuzz mutagen customtkinter
+pip install -r requirements.txt
 ```
 
-`tkinter` fait partie de la bibliothèque standard Python sur la plupart des distributions ; sous Linux, il peut nécessiter un paquet système séparé (ex. `python3-tk`).
+`pillow` est nécessaire au logo de l'interface (`CTkImage` de CustomTkinter l'exige, mais CustomTkinter ne le déclare pas comme dépendance). `tkinter` fait partie de la bibliothèque standard Python sur la plupart des distributions ; sous Linux, il peut nécessiter un paquet système séparé (ex. `python3-tk`).
 
 ---
 
@@ -173,7 +177,7 @@ $env:LRC_LOG_FILE = "C:\chemin\vers\lrc-inject.log"
 python lrc-inject.py
 ```
 
-6️⃣︲**Lancer les tests (14 tests, ~2 s).**
+6️⃣︲**Lancer les tests (45 tests, ~2 s).**
 
 ```bash
 python test_core.py
@@ -181,7 +185,6 @@ python test_core.py
 
 7️⃣︲**(Optionnel) Diagnostiquer un démarrage qui échoue.**
 
-* `diag.bat` (Windows) : double-cliquez — le terminal reste ouvert, affiche l'interpréteur Python, l'état des dépendances, puis écrit la trace de démarrage dans `diag.log` et le code de sortie.
 * Depuis un terminal : `python lrc-inject.py` affiche la traceback complète en cas d'erreur.
 * Sous VS Code, « Run Active File » utilise l'interpréteur Python sélectionné en bas à droite de la fenêtre : vérifiez que c'est bien celui où les dépendances sont installées (`pip show customtkinter`).
 
@@ -253,14 +256,16 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 > Le projet ne comporte pas de fichier de configuration externe : les seuls réglages disponibles sont ceux exposés dans l'interface (plus une variable d'environnement pour le log).
 
 * ` 🧵 `︲**Threads** : champ numérique dans l'interface (borné automatiquement à 1–32 selon le mode — la valeur réellement utilisée est reflétée dans le champ). La case **Auto** (activée par défaut) utilise automatiquement le nombre de cœurs CPU, idéal si vous ne savez pas quoi saisir.
-* ` 🚦 `︲**Mode API (SPEED / COOL)** : deux boutons dans la carte Options (ligne de réglage du débit).
-  - **SPEED** *(défaut)* : rafales sans limite — la bibliothèque est scannée au débit maximum offert par vos threads et votre connexion. Si LRCLIB coupe (`429`), l'outil marque une pause `[Rate limit]` unique et **coordonnée** (tous les threads attendent, `Retry-After` honoré) puis repart à fond. **À utiliser** pour un passage de masse rapide à froid, quand le cache n'a pas encore ses entrées.
-  - **COOL** : débit lissé à ~10 requêtes/s via un **token bucket partagé** (`_wait_token`). **À utiliser** quand le rate-limit fréquent agace (petites bibliothèques, re-runs partiels) ou pour un flux parfaitement fluide sans à-coups.
-  - Dans les deux modes, `Retry-After` est obligatoirement honoré (exigence [LRCLIB](https://lrclib.net/docs), sinon bannissement temporaire). Consultez la doc officielle : User-Agent obligatoire, throttling 200–500 ms conseillé, `duration` fortement recommandé.
+* ` 🚦 `︲**Débit API (curseur 1 → 25 req/s)** : un curseur dans la carte Options fixe le **plafond** de requêtes par seconde (25 par défaut).
+  - Le lissage est permanent : un **token bucket partagé** (`RateLimiter`, dans `core.py`) espace les requêtes quel que soit le nombre de threads. Plus aucun mode « rafale illimitée ».
+  - **Réaction au `429`/`503`** : `Retry-After` est honoré, le débit effectif est **divisé par deux** (plancher 2 req/s), et chaque requête est réessayée jusqu'à 3 fois. Après 25 réponses saines d'affilée, le débit remonte par paliers de 1 req/s — **sans jamais dépasser le curseur**.
+  - Une erreur transitoire (`429`, `5xx`) **ne met rien en cache** : la piste sera retentée au prochain passage. Un `400` en revanche est une requête invalide : il est signalé tel quel dans le log, sans déclencher de repli.
+  - LRCLIB étant un service gratuit, ce curseur permet de rester prudent sur une grosse bibliothèque. La [doc officielle](https://lrclib.net/docs) recommande 200–500 ms entre requêtes (~2–5 req/s) et menace de bannissement temporaire en cas de non-respect de `Retry-After`.
 * ` 👤 `︲**User-Agent nominatif** : `lrc-injector/1.2 (https://github.com/K4taV8/LRC-INJECTOR-PY)` envoyé sur chaque requête — exigence LRCLIB, faute de quoi l'API refuse (403).
 * ` ⏱️ `︲**Durée (`duration`)** : la durée de chaque piste (issue des tags FLAC locaux) est transmise lors de la requête directe — recommandation officielle LRCLIB : matching aux ±2 s, moins de faux résultats.
-* ` 💾 `︲**Cache** : fichier `lrc_cache.json`, généré automatiquement à côté du script (schéma versionné `v:1`, compatibilité ascendante — un schéma inconnu est ignoré). TTL de 30 jours sur les entrées « introuvable » (`no_sync`) : elles expirent seules et déclenchent une re-tentative. Aucune option de chemin personnalisé actuellement.
+* ` 💾 `︲**Cache** : fichier `lrc_cache.json`, généré automatiquement à côté du script (schéma versionné `v:1`, compatibilité ascendante — un schéma inconnu est ignoré). **TTL de 3 jours sur les entrées « introuvable »** (`miss`, ex-`404`) et **30 jours sur les entrées « trouvé sans paroles synchronisées »** (`no_sync`) : les deux expirent seules et déclenchent une re-tentative. Les caches `v:1` existants sont repris tels quels, une entrée `no_sync` sans `plainLyrics` étant reinterpretée comme un `miss`. Aucune option de chemin personnalisé actuellement.
 * ` 🎯 `︲**Seuil de similarité** : fixé en dur à `85%` (`rapidfuzz.fuzz.ratio`) dans le code source, non exposé dans l'interface.
+* ` ⏱️ `︲**Départage par la durée** : lors d'un repli sur `/api/search`, la durée locale entre dans le score (bonus si l'écart est ≤ 2 s, pénalité décroissante au-delà) — c'est le même critère que `/api/get`, et sans lui un live ou un remaster gagne trop souvent. La recherche estructurée `track_name`+`artist_name` complète les trois requêtes `q`.
 * ` 📄 `︲**Log fichier (optionnel)** : définissez la variable d'environnement `LRC_LOG_FILE` vers un fichier `.log` pour conserver une trace persistante (append par paquet) en plus de la fenêtre.
 
 ---
@@ -273,10 +278,10 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 > [!IMPORTANT]
 > Le projet est structuré en **noyau pur + interface** :
 >
-> - `core.py` — logique pure (nettoyage, matching flou, parsing LRC, cache disque), **sans Tkinter**, importable et testable seul.
+> - `core.py` — logique pure **sans Tkinter**, importable et testable seul : `clean()` / `match()` / `strip_timestamps()` / `_parse_result()`, `build_get_params()` (validation des paramètres), `entry_expired()` (TTL du cache), `RateLimiter` (token bucket + repli sur `429`), `scaled_size()` / `opening_geometry()` (taille et centrage en pixels réels), `resolve_asset()` (assets optionnels), cache disque.
 > - `lrc-inject.py` — interface CustomTkinter + orchestration réseau/threads.
-> - `test_core.py` — suite de test assert-based (14 tests, `python test_core.py`).
-> - `diag.py` / `diag.bat` — mouture d'inspection du démarrage (interpréteur, dépendances, trace écrite dans `diag.log`, code de sortie).
+> - `test_core.py` — suite de test assert-based (45 tests, `python test_core.py`).
+> - `Logo.png` — logo de l'application (barre de titre, barre des tâches, en-tête). Optionnel : son absence n'empêche pas le démarrage.
 
 | Bloc fonctionnel                     | Rôle                                                                 |
 |---------------------------------------|-----------------------------------------------------------------------|
@@ -284,13 +289,17 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 | `_load_cache()` / `_save_cache()` / `_mark_dirty()` | Gestion du cache disque (`lrc_cache.json`) — `core.py`, flush périodique, schéma `v:1`. |
 | `fetch_lrc()` / `_search_fallback()` / `_parse_result()` | Récupération des paroles via l'API LRCLIB (requête directe + repli recherche budgeté, meilleur candidat). |
 | `clean()` / `match()` / `strip_timestamps()` | Normalisation de chaînes, comparaison floue, dérivation `LYRICS` → `UNSYNCEDLYRICS` — `core.py`. |
+| `build_get_params()` / `entry_expired()` / `resolve_asset()` | Validations pures — `core.py` : requête `/api/get` conforme au doc LRCLIB (params purgés, `duration` bornée à 1–3600), TTL du cache (3 j / 30 j), asset optionnel. |
+| `scaled_size()` / `opening_geometry()` | Taille d'ouverture en pixels réels et centrage exact — `core.py` (conversion DPI, position en pixels physiques, bordure du cadre). |
+| `_score_entry()` / `_search_queries()` | Repli `/api/search` : durée locale en discriminant (±2 s) + requête structurée `track_name`+`artist_name`. |
+| `_set_app_user_model_id()` / `_load_logo()` | Identité d'application et logo : `AppUserModelID` avant la fenêtre (icône de barre des tâches au lieu du logo Py), `Logo.png` en barre de titre et en-tête. |
 | `_collect_flac()`                     | Parcours récursif + déduplication par inode (hardlinks/doublons).    |
 | `process_file()` / `run()`            | Logique du mode **injection** (START) sur un fichier / un lot.       |
 | `check_one()` / `check_files()`       | Logique du mode **audit/réparation** (CHECK) sur un fichier / un lot. |
 | `log()` / `_flush_log()`              | File d'attente de log + rendu par lots dans le composant `Text`, coloré par tag (option fichier `LRC_LOG_FILE`). |
-| `_wait_token()` / `_rate_limit_pause()` / `_api_get()` | Politique de débit : token bucket optionnel (COOL, ~10 req/s) et pause coordonnée sur `429` honorant `Retry-After` (tous modes). |
+| `_LIM.acquire()` / `_rate_limit_pause()` / `_api_get()` / `set_rate_ceiling()` | Politique de débit : token bucket partagé lissé (`RateLimiter`), plafond fixé par le curseur, repli sur `429`/`5xx` avec `Retry-After` et division du débit par deux. |
 | `start_pulse()` / `stop_pulse()` / `update_progress()` | Pilotage de la barre de progression (indéterminée puis déterminée). |
-| Section `Fenêtre` / `Palette` / `Body` | Construction de l'interface CustomTkinter (palette maquette `style_v2.css`, cartes `Options`/`Log`, boutons, status bar). |
+| Section `Fenêtre` / `Header` / `Palette` / `Body` | Construction de l'interface CustomTkinter (palette maquette `style_v2.css`, en-tête logo + nom, cartes `Options`/`Log`, boutons, status bar). |
 
 ---
 
@@ -319,7 +328,7 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 
 * ` 🔁 `︲**Retry HTTP borné** (2 tentatives, backoff `0.5s`) : tolère les erreurs transitoires de l'API sans bloquer indéfiniment un thread.
 
-* ` 🪣 `︲**Token bucket pour le mode COOL** : lissage du débit à ~10 req/s (consommations par paquets de tokens sous verrou) — flux régulier sans à-coups pour LRCLIB.
+* ` 🪣 `︲**Token bucket partagé** : lissage du débit sous verrou, plafond réglable de 1 à 25 req/s — flux régulier, sans à-coups ni rafales, pour LRCLIB.
 
 * ` 🎯 `︲**Recherche de repli budgetée** (12 s max) : le meilleur candidat est choisi par score combiné (ratio artiste + ratio titre) sans jamais dépasser le budget total.
 
@@ -336,10 +345,10 @@ Bouton `Clear Cache` (carte Options, ligne de débit) : supprime `lrc_cache.json
 |-------|--------------|
 | **Écriture FLAC in-place** (`audio.save()` sans fichier temp) | mutagen 1.46+ ne supporte pas `save(tmp)` vers un fichier neuf — il vérifie le header FLAC du fichier de sortie, ce qui échoue sur un fichier vide. `save()` in-place écrit les nouveaux tags Vorbis en tête de fichier. Si le bloc Vorbis change de taille (cas systématique avec `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` décale physiquement les données audio sur le disque. Un crash/coupure *pendant ce décalage* peut tronquer l'audio et pas seulement les tags. Ce scénario est très improbable (fenêtre de quelques ms par fichier sur un lot de 189 fichiers, seuls les fichiers en cours d'écriture au moment précis du crash sont à risque), mais documenté pour transparence. Pour une sécurité maximale, sauvegardez votre bibliothèque avant un traitement de masse. |
 | **`except Exception` généralisés** | Application GUI : un crash silencieux avec message dans le log est préférable à un traceback non géré qui ferme la fenêtre. Chaque erreur est loggée avec son contexte. |
-| **Noyau pur extrait (`core.py`)** | La logique pure (nettoyage, matching, parsing, cache) a été extraite de `lrc-inject.py` (GUI + orchestration) — désormais testable unitairement (14 tests). |
+| **Noyau pur extrait (`core.py`)** | La logique pure (nettoyage, matching, parsing, cache, rate limiter, geometrie) a été extraite de `lrc-inject.py` (GUI + orchestration) — désormais testable unitairement (45 tests). |
 | **`daemon=True` sur les workers** | Le `join(timeout=30)` dans `on_close()` laisse le temps de finir. Si le timeout expire, le thread est tué ; l'écriture in-place peut laisser un fichier en cours de décalage audio dans un état instable. Idéalement, attendre la fin du traitement avant de fermer l'application. |
-| **TTL ciblé sur le cache** | Les entrées "introuvable" (`no_sync`) expirent après 30 jours (re-tentative automatique) ; les paroles, réponses instrumentales et réussites restent permanentes. Bouton `Clear Cache` pour repartir de zéro immédiatement. |
-| **Rate limiting : SPEED par défaut, COOL en option** | Défaut = rafales illimitées (débit max, idéal cache à froid) + pause `429`/`Retry-After` **coordonnée** entre threads. Option COOL = token bucket ~10 req/s, pour des sources plus régulières ou des re-runs fréquents. Choix exposé dans l'interface (`SPEED`/`COOL`). |
+| **TTL ciblés sur le cache** | Les entrées "introuvable" (`miss`, ex-`404`) expirent après **3 jours** (LRCLIB récupère les pistes manquantes en arrière-plan) ; les entrées "trouvé sans paroles synchronisées" (`no_sync`) après **30 jours** ; les paroles, réponses instrumentales et réussites restent permanentes. Bouton `Clear Cache` pour repartir de zéro immédiatement. |
+| **Débit lissé réglable** | Un seul mode, plus de rafales illimitées : token bucket partagé plafonné par un curseur (1 → 25 req/s, défaut 25). Sur `429`/`503`, `Retry-After` est honoré, le débit est divisé par deux puis remonté par paliers, sans dépasser le curseur. Une erreur transitoire n'est jamais cachée. |
 | **`_save_flac(audio, path)` ignore `path`** | Signature conservée pour compatibilité. `audio.save()` utilise toujours le chemin interne du fichier. |
 
 ---

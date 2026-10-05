@@ -12,68 +12,77 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from core import (MATCH_THRESHOLD, clean, cache_key,
-                  clear_cache as _purge_cache, fold,
-                  get_fuzz, match, strip_timestamps, _cache, _cache_lock,
-                  _mark_dirty, _parse_result, _save_cache, set_logger as _set_logger,
-                  _NO_SYNC_TTL)
+from core import (MATCH_THRESHOLD, RateLimiter, build_get_params, clean, cache_key,
+                  clear_cache as _purge_cache, entry_expired,
+                  fold, get_fuzz, match, opening_geometry, resolve_asset,
+                  strip_timestamps,
+                  _cache, _cache_lock,
+                  _mark_dirty, _parse_result, _save_cache, set_logger as _set_logger)
 
 LRCLIB_API = "https://lrclib.net/api/get"
 SESSION = None
-_rl_lock = threading.Lock()
-_rl_until = 0.0
-_rl_tokens = 0.0
-_rl_last = time.time()
-_RATE_PER_SEC = 10.0
-_cool = threading.Event()
+RATE_MAX = 25.0
+RATE_MIN = 2.0
+TRANSIENT = (429, 500, 502, 503, 504)
+_MAX_ATTEMPTS = 3
 
-def _set_rate_limit_cool(b):
-    if b:
-        _cool.set()
-    else:
-        _cool.clear()
+_LIM = RateLimiter(RATE_MAX, min_rate=RATE_MIN)
+_pause_lock = threading.Lock()
+_pause_until = 0.0
 
-def _wait_token():
-    global _rl_tokens, _rl_last
-    while _cool.is_set():
-        with _rl_lock:
-            now = time.time()
-            _rl_tokens = min(_rl_tokens + (now - _rl_last) * _RATE_PER_SEC, _RATE_PER_SEC)
-            _rl_last = now
-            if _rl_tokens >= 1.0:
-                _rl_tokens -= 1.0
-                return
-        if _cancel.is_set():
-            return
-        time.sleep(0.05)
+def set_rate_ceiling(rate):
+    _LIM.set_ceiling(rate)
 
-# ponytail: rafales illimitées par défaut (mode SPEED, max rapide), seule une pause
-# coordonnée honore Retry-After. Mode COOL -> _wait_token lisse à 10 req/s.
+def _hold(seconds):
+    global _pause_until
+    with _pause_lock:
+        _pause_until = max(_pause_until, time.time() + seconds)
+
 def _rate_limit_pause():
     while True:
-        with _rl_lock:
-            wait = _rl_until - time.time()
-        if wait <= 0:
-            return
-        if _cancel.is_set():
+        with _pause_lock:
+            wait = _pause_until - time.time()
+        if wait <= 0 or _cancel.is_set():
             return
         time.sleep(min(0.2, wait))
 
+def _retry_after(r):
+    try:
+        return max(0.0, float(r.headers.get("Retry-After", 2)))
+    except (AttributeError, TypeError, ValueError):
+        return 2.0
+
+def _api_error(r):
+    try:
+        data = r.json()
+    except Exception:
+        return "paramètres invalides"
+    if isinstance(data, dict) and data.get("message"):
+        return str(data["message"])
+    return "paramètres invalides"
+
+# ponytail: débit unique lissé à RATE_MAX (curseur), abaissé automatiquement
+# sur 429/5xx via Retry-After puis remonté après une série de succès.
 def _api_get(url, params=None, timeout=None):
-    global _rl_until
-    _wait_token()
-    _rate_limit_pause()
-    r = get_session().get(url, params=params, timeout=timeout)
-    if r.status_code == 429:
-        try:
-            retry_after = float(r.headers.get("Retry-After", 2))
-        except ValueError:
-            retry_after = 2.0
-        with _rl_lock:
-            _rl_until = max(_rl_until, time.time() + retry_after)
-        log(f"[Rate limit] API saturée, pause {retry_after:.0f}s...")
+    """Rend la réponse après avoir lissé le débit et réessayé les erreurs
+    transitoires. Un 429/5xx est réessayé _MAX_ATTEMPTS fois en honorant
+    Retry-After, en divisant le débit par deux à chaque tentative. Au terme,
+    la dernière réponse est rendue telle quelle : l'appelant doit alors
+    ne rien mettre en cache, une erreur transitoire n'est pas un verdict.
+    """
+    r = None
+    for _ in range(_MAX_ATTEMPTS):
+        _LIM.acquire(cancel=_cancel.is_set)
         _rate_limit_pause()
         r = get_session().get(url, params=params, timeout=timeout)
+        if r.status_code not in TRANSIENT:
+            _LIM.on_success()
+            return r
+        retry_after = _retry_after(r)
+        rate = _LIM.on_throttle(retry_after)
+        log(f"[Rate limit] HTTP {r.status_code} — pause {retry_after:.0f}s, "
+            f"débit ajusté à {rate:.1f} req/s")
+        _hold(retry_after)
     return r
 
 def get_session():
@@ -262,35 +271,60 @@ def update_progress(val, maxv):
 
 SEARCH_API = "https://lrclib.net/api/search"
 _FALLBACK_BUDGET = 12.0
+_DURATION_TOL = 2.0
+_DURATION_WEIGHT = MATCH_THRESHOLD * 2
 
-def _search_fallback(artist, title, key):
-    fuzz = get_fuzz()
+def _search_queries(artist, title):
+    queries = []
     seen = set()
+    for q in (f"{artist} {title}", title, f"{fold(artist)} {fold(title)}"):
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            queries.append({"q": q})
+    if title.strip():
+        queries.append({"track_name": title.strip(), "artist_name": artist.strip()})
+    return queries
+
+def _score_entry(entry, ca, ct, duration):
+    """Score de pertinence d'un résultat de recherche.
+
+    Le titre et l'artiste ouvrent la porte (seuil de similarité), puis la
+    durée départage les versions : c'est le même critère que celui qu'utilise
+    /api/get (±2 s), et sans lui un live ou un remaster gagne trop souvent.
+    """
+    fuzz = get_fuzz()
+    ra = fuzz.ratio(ca, clean(entry.get("artistName", "")))
+    rt = fuzz.ratio(ct, clean(entry.get("trackName", "")))
+    if ra < MATCH_THRESHOLD or rt < MATCH_THRESHOLD:
+        return None
+    score = ra + rt
+    remote = entry.get("duration")
+    if duration and isinstance(remote, (int, float)):
+        delta = abs(remote - duration)
+        score += _DURATION_WEIGHT if delta <= _DURATION_TOL else max(0.0, 20.0 - delta)
+    return score
+
+def _search_fallback(artist, title, key, duration=None):
     ca, ct = clean(artist), clean(title)
-    queries = [f"{artist} {title}", title, f"{fold(artist)} {fold(title)}"]
     best_lrc = None
     best_plain = None
     score_lrc = -1
     score_plain = -1
     t0 = time.time()
-    for q in queries:
-        if q in seen:
-            continue
-        seen.add(q)
+    for params in _search_queries(artist, title):
         remaining = _FALLBACK_BUDGET - (time.time() - t0)
         if remaining <= 0:
             break
         try:
-            s = _api_get(SEARCH_API, params={"q": q}, timeout=min(8, remaining))
+            s = _api_get(SEARCH_API, params=params, timeout=min(8, remaining))
             if s.status_code != 200:
                 continue
             for entry in s.json():
-                ra = fuzz.ratio(ca, clean(entry.get("artistName", "")))
-                rt = fuzz.ratio(ct, clean(entry.get("trackName", "")))
-                if ra < MATCH_THRESHOLD or rt < MATCH_THRESHOLD:
+                score = _score_entry(entry, ca, ct, duration)
+                if score is None:
                     continue
                 lrc, inst = _parse_result(entry)
-                score = ra + rt
                 if lrc and score > score_lrc:
                     best_lrc = (lrc, entry, inst)
                     score_lrc = score
@@ -316,7 +350,7 @@ def _search_fallback(artist, title, key):
         _mark_dirty()
         return None, entry, False
     with _cache_lock:
-        _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
+        _cache[key] = {"lrc": None, "inst": False, "miss": True,
                        "pl": None, "ts": time.time()}
     _mark_dirty()
     return None, None, False
@@ -328,31 +362,31 @@ def fetch_lrc(artist, title, album="", duration=None):
         if key in _cache:
             _stat_hit()
             c = _cache[key]
-            if c.get("no_sync") and c.get("ts") and time.time() - c["ts"] > _NO_SYNC_TTL:
+            if entry_expired(c, time.time()):
                 del _cache[key]
                 deleted = True
             elif c.get("lrc"):
                 return c["lrc"], {"artistName": c["a"], "trackName": c["t"], "plainLyrics": c.get("pl")}, c.get("inst", False)
             elif c.get("inst"):
                 return None, None, True
-            elif c.get("no_sync"):
+            elif c.get("no_sync") or c.get("miss"):
                 if c.get("pl"):
                     return None, {"artistName": c.get("a"), "trackName": c.get("t"), "plainLyrics": c.get("pl")}, False
                 return None, None, False
             else:
                 del _cache[key]
                 deleted = True
-    _stat_miss()
     if deleted:
         _mark_dirty()
     try:
-        params = {
-            "artist_name": artist,
-            "track_name": title,
-            "album_name": album,
-        }
-        if duration:
-            params["duration"] = int(round(duration))
+        params, dropped = build_get_params(artist, title, album, duration)
+        if params is None:
+            log(f"[ERROR] Signature inexploitable (artiste ou titre vide) : "
+                f"{artist!r} - {title!r}")
+            return None, None, False
+        _stat_miss()
+        if dropped:
+            log(f"[WARN] /api/get : {', '.join(dropped)} ignoré pour {artist} - {title}")
         r = _api_get(LRCLIB_API, params=params, timeout=(3, 8))
         if r.status_code == 200:
             data = r.json()
@@ -371,9 +405,16 @@ def fetch_lrc(artist, title, album="", duration=None):
             _mark_dirty()
             return None, data, False
 
-        return _search_fallback(artist, title, key)
+        if r.status_code == 404:
+            return _search_fallback(artist, title, key, duration)
+        if r.status_code == 400:
+            log(f"[ERROR] /api/get 400 sur {artist} - {title} : {_api_error(r)}")
+            return None, None, False
+        log(f"[WARN] /api/get {r.status_code} sur {artist} - {title} "
+            f"— abandon, rien mis en cache (erreur transitoire)")
+        return None, None, False
     except Exception:
-        lrc, data, inst = _search_fallback(artist, title, key)
+        lrc, data, inst = _search_fallback(artist, title, key, duration)
         if lrc or inst:
             return lrc, data, inst
         return None, None, False
@@ -715,6 +756,22 @@ try:
 except Exception:
     pass
 
+# ── Identité d'application (icône de la barre des tâches / Alt-Tab) ──
+# Sans AppUserModelID explicite, le regroupement de la barre des tâches se
+# fait sur le chemin de l'exécutable : elle affiche donc l'icône de
+# python.exe (le logo Py) et ignore celle de la fenêtre. Doit être appelé
+# AVANT la création de la fenêtre, sinon Windows a déjà fait son grouping.
+APP_USER_MODEL_ID = "K4taV8.LRC-INJECTOR-PY"
+
+def _set_app_user_model_id():
+    try:
+        from ctypes import windll
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception as e:
+        log(f"[WARN] AppUserModelID non défini : {e}")
+
+_set_app_user_model_id()
+
 # ── Barre de titre Windows sombre ──
 def _force_dark_titlebar(win):
     try:
@@ -743,9 +800,6 @@ TXT_MUT  = "#767880"
 GREEN    = "#3a8f56"
 GREEN_H  = "#4aa263"
 RED      = "#c13b30"
-RED_H    = "#d9534a"
-BLUE     = "#38bdf8"
-BLUE_H   = "#5ecdf9"
 SM, MD, LG = 8, 10, 14
 F_UI   = ("Segoe UI", 12)
 F_ACC  = ("Segoe UI", 12, "bold")
@@ -757,12 +811,72 @@ F_LOG  = ("Consolas", 11)
 root = ctk.CTk(fg_color=BG)
 _force_dark_titlebar(root)
 root.title("LRC Injector")
-W, H = 1218, 948
-sw = root.winfo_screenwidth()
-sh = root.winfo_screenheight()
-x = (sw - W) // 2
-y = (sh - H) // 2
-root.geometry(f"{W}x{H}+{x}+{y}")
+
+# ── Logo (fenêtre, barre des tâches, coin haut-gauche de l'app) ──
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_SIZE = 32
+LOGO_PATH = resolve_asset(APP_DIR, "Logo.png")
+# Les deux objets doivent survivre au garbage collector, sans quoi Tk les
+# libère et l'icône disparaît ou vire au noir.
+_logo_photo = None
+_logo_ctk = None
+
+def _load_logo():
+    global _logo_photo, _logo_ctk
+    if not LOGO_PATH:
+        return
+    try:
+        _logo_photo = tk.PhotoImage(file=LOGO_PATH)
+        root.iconphoto(True, _logo_photo)
+    except Exception as e:
+        _logo_photo = None
+        log(f"[WARN] Icône de fenêtre ignorée : {e}")
+    try:
+        from PIL import Image
+        _logo_ctk = ctk.CTkImage(Image.open(LOGO_PATH), size=(LOGO_SIZE, LOGO_SIZE))
+    except Exception as e:
+        _logo_ctk = None
+        log(f"[WARN] Logo de l'interface ignoré : {e}")
+
+_load_logo()
+
+# Taille d'ouverture annoncee en pixels physiques, convertie en unites Tk
+# selon le DPI reel de l'ecran (852x952 a 125% -> geometry() 682x762).
+OPEN_W_PX = 852
+OPEN_H_PX = 952
+
+def _display_scale(win):
+    try:
+        from ctypes import windll
+        return max(1.0, windll.user32.GetDpiForWindow(win.winfo_id()) / 96.0)
+    except Exception:
+        return 1.0
+
+def _client_border(win):
+    """Decalage (gauche, haut) entre le cadre de la fenetre et sa zone client.
+
+    Sans lui, un centrage calculé sur la seule zone client decale le cadre
+    visible de la largeur d'une bordure.
+    """
+    try:
+        from ctypes import windll, byref, c_long, Structure
+        hwnd = windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+
+        class _RECT(Structure):
+            _fields_ = [("l", c_long), ("t", c_long), ("r", c_long), ("b", c_long)]
+
+        rc = _RECT()
+        if not windll.user32.GetWindowRect(hwnd, byref(rc)):
+            return 0, 0
+        return max(0, win.winfo_rootx() - rc.l), max(0, win.winfo_rooty() - rc.t)
+    except Exception:
+        return 0, 0
+
+W, H, GX, GY = opening_geometry(OPEN_W_PX, OPEN_H_PX,
+                                root.winfo_screenwidth(), root.winfo_screenheight(),
+                                _display_scale(root),
+                                *_client_border(root))
+root.geometry(f"{W}x{H}+{GX}+{GY}")
 root.minsize(680, 500)
 
 # ── Variables ──
@@ -779,19 +893,27 @@ def _toggle_auto():
 main = ctk.CTkFrame(root, fg_color="transparent")
 main.pack(fill="both", expand=True, padx=24, pady=(18, 12))
 main.grid_columnconfigure(0, weight=1)
-main.grid_rowconfigure(4, weight=1)
+main.grid_rowconfigure(5, weight=1)
+
+# ── Header (logo + nom, coin haut-gauche de la fenêtre) ──
+header = ctk.CTkFrame(main, fg_color="transparent")
+header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+if _logo_ctk is not None:
+    ctk.CTkLabel(header, image=_logo_ctk, text="").pack(side="left", padx=(0, 10))
+ctk.CTkLabel(header, text="LRC Injector", font=("Segoe UI", 15, "bold"),
+             text_color=TXT).pack(side="left")
 
 # ── Card Options ──
 opts = ctk.CTkFrame(main, fg_color=SURFACE, corner_radius=LG,
                     border_width=1, border_color=BORDER)
-opts.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+opts.grid(row=1, column=0, sticky="ew", pady=(0, 16))
 
 opts_in = ctk.CTkFrame(opts, fg_color="transparent")
 opts_in.pack(fill="both", expand=True, padx=18, pady=(16, 16))
 opts_in.grid_columnconfigure(1, weight=1)
 
 ctk.CTkLabel(opts_in, text="OPTIONS", font=F_SEC, text_color=TXT_SEC,
-             anchor="w").grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+             anchor="w").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
 def _opt_label(txt, row):
     ctk.CTkLabel(opts_in, text=txt, font=F_UI, text_color=TXT_SEC, width=70,
@@ -831,42 +953,32 @@ auto_chk.pack(side="left", padx=(10, 0))
 
 # API rate
 _opt_label("API rate:", 3)
-speed_var = tk.BooleanVar(value=True)
+rate_var = tk.IntVar(value=int(RATE_MAX))
 
-def _style_mode_btns():
-    on = speed_var.get()
-    speed_btn.configure(fg_color=RED if on else BG_IN,
-                        hover_color=RED_H if on else ELEV_H,
-                        text_color=TXT if on else TXT_SEC,
-                        border_width=1,
-                        border_color=RED if on else BORDER_IN)
-    cool_btn.configure(fg_color=BLUE if not on else BG_IN,
-                       hover_color=BLUE_H if not on else ELEV_H,
-                       text_color="#0a0a0c" if not on else TXT_SEC,
-                       border_width=1,
-                       border_color=BLUE if not on else BORDER_IN)
+def _on_rate_change(value):
+    ceiling = max(1.0, float(value))
+    set_rate_ceiling(ceiling)
+    rate_label.configure(text=f"{int(round(ceiling))} req/s")
 
-def _set_speed(on):
-    speed_var.set(on)
-    _set_rate_limit_cool(not on)
-    _style_mode_btns()
-
-mode_frame = ctk.CTkFrame(opts_in, fg_color="transparent")
-mode_frame.grid(row=3, column=1, sticky="w", padx=12, pady=5)
-speed_btn = ctk.CTkButton(mode_frame, text="SPEED", command=lambda: _set_speed(True),
-                          width=92, height=38, font=F_ACC, corner_radius=MD, border_width=1)
-cool_btn = ctk.CTkButton(mode_frame, text="COOL", command=lambda: _set_speed(False),
-                         width=92, height=38, font=F_ACC, corner_radius=MD, border_width=1)
-speed_btn.pack(side="left", padx=(0, 4))
-cool_btn.pack(side="left", padx=(4, 0))
-_style_mode_btns()
+rate_frame = ctk.CTkFrame(opts_in, fg_color="transparent")
+rate_frame.grid(row=3, column=1, sticky="w", padx=12, pady=5)
+rate_slider = ctk.CTkSlider(rate_frame, from_=1, to=int(RATE_MAX),
+                            number_of_steps=int(RATE_MAX) - 1,
+                            command=_on_rate_change, width=140, height=24,
+                            button_color=ELEV_H, button_hover_color=TXT_SEC,
+                            progress_color=GREEN, fg_color=BORDER)
+rate_slider.set(RATE_MAX)
+rate_slider.grid(row=0, column=0, sticky="w")
+rate_label = ctk.CTkLabel(rate_frame, text=f"{int(RATE_MAX)} req/s", font=F_SUB,
+                          text_color=TXT_MUT, width=72, anchor="w")
+rate_label.grid(row=0, column=1, padx=(10, 0))
 
 clear_cache_btn = _opt_btn(opts_in, "Clear Cache", clear_cache, width=112)
 clear_cache_btn.grid(row=3, column=2, sticky="e", pady=5)
 
 # ── Actions ──
 acts = ctk.CTkFrame(main, fg_color="transparent")
-acts.grid(row=1, column=0, pady=(0, 10))
+acts.grid(row=2, column=0, pady=(0, 10))
 start_btn = ctk.CTkButton(acts, text="START", command=start, font=F_ACC,
                           fg_color=GREEN, hover_color=GREEN_H, text_color=TXT,
                           corner_radius=MD, height=42, width=140)
@@ -884,7 +996,7 @@ check_btn.pack(side="left", padx=7)
 
 # ── Progress ──
 prog_frame = ctk.CTkFrame(main, fg_color="transparent")
-prog_frame.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+prog_frame.grid(row=3, column=0, sticky="ew", pady=(0, 4))
 prog_frame.grid_columnconfigure(0, weight=1)
 progress = ctk.CTkProgressBar(prog_frame, height=8, corner_radius=0,
                               fg_color=BG_IN, progress_color=GREEN)
@@ -895,12 +1007,12 @@ prog_label.grid(row=0, column=1, padx=(10, 0))
 
 # ── Separator ──
 sep = ctk.CTkFrame(main, fg_color=BORDER, height=1, corner_radius=0)
-sep.grid(row=3, column=0, sticky="ew", pady=(2, 12))
+sep.grid(row=4, column=0, sticky="ew", pady=(2, 12))
 
 # ── Card Log ──
 log_frame = ctk.CTkFrame(main, fg_color=SURFACE, corner_radius=LG,
                          border_width=1, border_color=BORDER)
-log_frame.grid(row=4, column=0, sticky="nsew")
+log_frame.grid(row=5, column=0, sticky="nsew")
 
 log_in = ctk.CTkFrame(log_frame, fg_color="transparent")
 log_in.pack(fill="both", expand=True, padx=16, pady=(14, 14))

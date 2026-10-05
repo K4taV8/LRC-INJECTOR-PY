@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/FLAC-mutagen-4b0082?style=for-the-badge">
   <img src="https://img.shields.io/badge/LRCLIB-API-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/Threaded-ThreadPoolExecutor-critical?style=for-the-badge">
-  <img src="https://img.shields.io/badge/API_Mode-SPEED_%7C_COOL-8A2BE2?style=for-the-badge">
+  <img src="https://img.shields.io/badge/API_rate-1_%E2%86%92_25_req%2Fs-8A2BE2?style=for-the-badge">
   <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=for-the-badge">
   <img src="https://img.shields.io/badge/AI_Powered-DeepSeek_V4_|_Claude-8A2BE2?style=for-the-badge">
 </p>
@@ -69,7 +69,7 @@ The script specifically targets the `FLAC` format and relies on two Vorbis Comme
 > - ` 💉 ` **START** ︲ Inject missing lyrics on a folder or a `.flac` file.
 > - ` 🔍 ` **CHECK**︲ Audit + automatic repair of tags that are present but incomplete.
 
-* ` 🌐 `︲**Fetching via the LRCLIB API** : direct query (`artist`/`track`/`album`) with the **track duration** (`duration`, read from local FLAC tags — official LRCLIB recommendation : ±2 s matching, fewer false positives), then automatic fallback to the search endpoint with several query variants (exact name, title only, ASCII transliterated version) — all within a bounded budget (12 s).
+* ` 🌐 `︲**Fetching via the LRCLIB API** : direct query (`artist`/`track`/`album`) with the **track duration** (`duration`, read from local FLAC tags — official LRCLIB recommendation : ±2 s matching, fewer false positives; `duration` outside the 1–3600 s range is dropped and reported), then automatic fallback to the search endpoint with several query variants (exact name, title only, ASCII transliterated version, structured `track_name`+`artist_name`) where the local duration also breaks ties — all within a bounded budget (12 s).
 
 * ` 🧠 `︲**Fuzzy similarity validation** (`rapidfuzz`) : API results are compared against the local file's artist and title (threshold `85%`) before injection, to filter out false positive.
 
@@ -79,17 +79,21 @@ The script specifically targets the `FLAC` format and relies on two Vorbis Comme
 
 * ` 🩹 `︲**Repairing CHECK mode** : if a file has `LYRICS` but not `UNSYNCEDLYRICS` (or the reverse), the tool regenerates the missing tag without a new network request when possible (local derivation by stripping timestamps).
 
-* ` 💾 `︲**Persistent local cache** (`lrc_cache.json`) : every artist/title pair already resolved (found, not found, or instrumental) is cached to avoid re-querying the API on later runs. Periodic writes (every 200 changes) plus a save on exit. "Not found" entries carry a **30-day TTL** : a track absent from the API today will be retried automatically in a month.
+* ` 💾 `︲**Persistent local cache** (`lrc_cache.json`) : every artist/title pair already resolved (found, not found, or instrumental) is cached to avoid re-querying the API on later runs. Periodic writes (every 200 changes) plus a save on exit. **Two distinct TTLs** : a *not found* track (`404`) is retried after **3 days** — LRCLIB picks missing tracks up in the background, so a miss is not final — while a track *found but without synced lyrics* is kept for **30 days**. Successful lookups never expire.
 
 * ` ⚙️ `︲**Multithreaded processing** : `ThreadPoolExecutor` with an adjustable thread count in the interface (1–32 for injection, 1–16 for checking).
 
-* ` 🔁 `︲**Resilient HTTP requests** : shared `requests` session with a retry strategy (2 attempts, exponential backoff) on status codes `500`, `502`, `503` — `429` (rate limit) is handled separately via a coordinated pause honoring `Retry-After`. Two selectable paces: **SPEED** (unlimited bursts) or **COOL** (smoothed rate, see [Configuration](#configuration)).
+* ` 🔁 `︲**Resilient HTTP requests** : shared `requests` session with a retry strategy on status codes `500`, `502`, `503`; `429` (rate limit) and `5xx` are handled by `_api_get()`, which honors `Retry-After` and halves the effective rate instead of only pausing once. A transient error never gets cached.
 
-* ` 🚦 `︲**SPEED / COOL API mode** : SPEED (default) does unlimited bursts — the scan runs at maximum throughput until LRCLIB rate-limits, takes a single coordinated pause, then resumes. COOL enforces a smooth flow of about 10 requests/s (token bucket) for polite and quiet scans.
+* ` 🚦 `︲**Adjustable API rate (1 → 25 req/s)** : a shared token bucket (`RateLimiter`) always smooths the flow, whatever the thread count — no more unlimited bursts. The UI slider sets the ceiling (25 req/s by default). On `429`/`503`, `Retry-After` is honored, the rate is halved (2 req/s floor) and climbs back by steps after 25 healthy responses, never above the slider.
 
 * ` ⏹️ `︲**Clean cancellation** : a `STOP` button interrupts the current batch (`threading.Event`), without corrupting the cache or leaving orphan threads.
 
-* ` 🖥️ `︲**Native dark interface** : `customtkinter` theme (custom palette matching the `style_v2.css` design mock, rounded cards, fixed paddings per component type, colored `START`/`STOP`/`SPEED`/`COOL` buttons), status-colored log (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), smooth determinate/indeterminate progress bar. Windows-only polish, silently skipped elsewhere: DPI awareness (per-monitor, `ctypes`) and dark title bar (`DwmSetWindowAttribute`).
+* ` 🎨 `︲**Application logo** (`Logo.png`) : shown in the title bar, in the **taskbar** and in the header at the top left of the window. An explicit `AppUserModelID` (`K4taV8.LRC-INJECTOR-PY`) is set **before** the window is created: without it, Windows groups the window under the executable path and shows `python.exe`'s icon (the Py logo) instead of the window's. Missing file = the app still starts, with the default icon.
+
+* ` 🖥️ `︲**Native dark interface** : `customtkinter` theme (custom palette matching the `style_v2.css` design mock, logo + app name header, rounded cards, fixed paddings per component type, colored `START`/`STOP` buttons, rate slider, `Auto` checkbox), status-colored log (`OK`, `MISS`, `REJECT`, `SKIP`, `ERROR`, `INST`), smooth determinate/indeterminate progress bar. Windows-only polish, silently skipped elsewhere: dark title bar (`DwmSetWindowAttribute`).
+
+* ` 📐 `︲**Window sized in real pixels** : startup targets **852 × 952 pixels** whatever the screen scaling. Tk applies the DPI factor to the *size* while Windows reads the *position* in physical pixels, so both are converted separately (`opening_geometry()`), and the window frame border is measured at startup for pixel-perfect centering.
 
 ---
 
@@ -152,8 +156,10 @@ cd <NAME_OF_THE_FOLDER>
 **3️⃣ Install the dependencies.**
 
 ```bash
-pip install requests rapidfuzz mutagen customtkinter
+pip install -r requirements.txt
 ```
+
+`pillow` is required for the in-app logo (`CTkImage` needs it, but CustomTkinter does not declare it as a dependency).
 
 `tkinter` is part of the Python standard library on most distributions. On Linux, it may require a separate system package (e.g. `python3-tk`).
 
@@ -173,7 +179,7 @@ $env:LRC_LOG_FILE = "C:\path\to\lrc-inject.log"
 python lrc-inject.py
 ```
 
-**6️⃣ Run the tests (14 tests, ~ 2 s).**
+**6️⃣ Run the tests (45 tests, ~ 2 s).**
 
 ```bash
 python test_core.py
@@ -181,7 +187,6 @@ python test_core.py
 
 **7️⃣ (Optional) Diagnose a failing startup.**
 
-* `diag.bat` (Windows) : double-click it — the terminal stays open, prints the Python interpreter, the state of the dependencies, then writes the startup trace to `diag.log` and the exit code.
 * From a terminal : `python lrc-inject.py` prints the full traceback on error.
 * In VS Code, "Run Active File" uses the Python interpreter selected at the bottom right of the window : make sure it is the one where the dependencies are installed (`pip show customtkinter`).
 
@@ -253,14 +258,17 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 > The project has no external configuration file : the only settings available are the ones exposed in the interface (plus one environment variable for the log).
 
 * ` 🧵 `︲**Threads** : numeric field in the interface (automatically clamped to 1–32 depending on the mode — the value actually used is reflected in the field). The **Auto** checkbox (enabled by default) uses the CPU core count automatically, ideal if you don't know what to enter.
-* ` 🚀 ` **API mode (SPEED / COOL)** : two buttons in the Options card, in the "API rate" row.
-  - **SPEED** *(default)* : unlimited bursts — the library is scanned at the maximum throughput your threads and connection allow. LRCLIB eventually throttles (`429`), the tool takes a single coordinated `[Rate limit]` pause (honoring `Retry-After`) then resumes at full speed. **Use it** for fast cold mass scans, when the cache is still empty.
-  - **COOL** : smoothed throughput of about 10 requests/s via a shared token bucket. **Use it** when frequent rate limits get annoying (small libraries, partial re-runs, polite sources / ban avoidance), or simply for a perfectly smooth flow without hiccups.
-  - `Retry-After` is always honored in both modes (LRCLIB requirement, else temporary ban). See the [official docs](https://lrclib.net/docs) for recommendations: mandatory User-Agent, 200–500 ms throttling, `duration` encouraged.
+* ` 🚀 ` **API rate (slider 1 → 25 req/s)** : a slider in the Options card sets the **ceiling** in requests per second (25 by default).
+  - Smoothing is permanent: a shared token bucket (`RateLimiter`, in `core.py`) paces the requests whatever the thread count. There is no more "unlimited burst" mode.
+  - **On `429`/`503`**: `Retry-After` is honored, the effective rate is **halved** (2 req/s floor) and the request is retried up to 3 times. After 25 healthy responses in a row the rate climbs back by 1 req/s steps — **never above the slider**.
+  - A transient error (`429`, `5xx`) is **never cached**: the track will be retried on the next run. A `400`, on the other hand, is an invalid request: it is reported as-is in the log, with no fallback triggered.
+  - LRCLIB being a free service, the slider lets you stay cautious on a large library. The [official docs](https://lrclib.net/docs) recommend 200–500 ms between requests (~2–5 req/s) and threaten a temporary ban if `Retry-After` is ignored.
 * ` 🪪 `︲**User-Agent** : set to `LRC-Injekt/1.0.1 (+https://github.com/LRC-Injekt)` — mandatory per the LRCLIB documentation to avoid a ban.
 * ` ⏱️ `︲**Track duration sent**: the FLAC `length` tag (when available) is passed as `duration` to the API — ±2 s matching as recommended, which filters out false positives.
-* ` 💾 ` **Cache** : `lrc_cache.json` file, generated automatically next to the script (versioned schema `v:1`, backward-compatible — an unknown schema is ignored). "Not found" entries have a **30-day TTL** and are re-queried automatically after expiry. No custom path option so far.
+* ` 💾 ` **Cache** : `lrc_cache.json` file, generated automatically next to the script (versioned schema `v:1`, backward-compatible — an unknown schema is ignored). **3-day TTL on "not found" entries** (`miss`, e.g. `404`) and **30 days on "found without synced lyrics"** (`no_sync`): both expire on their own and trigger a retry. Existing `v:1` caches are picked up as-is, a `no_sync` entry without `plainLyrics` being reinterpreted as a `miss`. No custom path option so far.
 * ` 🎯 `︲**Similarity threshold** : hardcoded to `85%` (`rapidfuzz.fuzz.ratio`) in the source code, not exposed in the interface.
+
+* ` ⏱️ `︲**Duration as tie-breaker** : when falling back to `/api/search`, the local duration feeds the score (bonus within 2 s, decreasing penalty beyond) — the same criterion `/api/get` uses, without which a live or a remaster too often wins. Structured `track_name`+`artist_name` search completes the three `q` queries.
 * ` 📄 `︲**File log (optional)** : set the `LRC_LOG_FILE` environment variable to a `.log` file to keep a persistent trace (appended in batches) in addition to the window.
 
 ---
@@ -273,10 +281,10 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 > [!IMPORTANT]
 > The project is structured as **pure core + interface** :
 >
-> - `core.py` — pure logic (cleaning, fuzzy matching, LRC parsing, disk cache), **no Tkinter**, importable and testable on its own.
+> - `core.py` — pure logic **with no Tkinter**, importable and testable on its own: `clean()` / `match()` / `strip_timestamps()` / `_parse_result()`, `build_get_params()` (parameter validation), `entry_expired()` (cache TTL), `RateLimiter` (token bucket + `429` fallback), `scaled_size()` / `opening_geometry()` (real-pixel sizing and centering), `resolve_asset()` (optional assets), disk cache.
 > - `lrc-inject.py` — CustomTkinter interface + network/threads orchestration.
-> - `test_core.py` — assert-based test suite (14 tests, `python test_core.py`).
-> - `diag.py` / `diag.bat` — startup inspection build (interpreter, dependencies, trace written to `diag.log`, exit code).
+> - `test_core.py` — assert-based test suite (45 tests, `python test_core.py`).
+> - `Logo.png` — application logo (title bar, taskbar, header). Optional: a missing file does not prevent startup.
 
 | Functional block                     | Role                                                                |
 |--------------------------------------|---------------------------------------------------------------------|
@@ -284,14 +292,18 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 | `_load_cache()` / `_save_cache()` / `_mark_dirty()`    | Disk cache management (`lrc_cache.json`) — `core.py`, periodic flush, `v:1` schema. |
 | `fetch_lrc()` / `_search_fallback()` / `_parse_result()` | Lyrics fetching via the LRCLIB API (direct query + budgeted search fallback, best candidate). |
 | `clean()` / `match()` / `strip_timestamps()` | String normalization, fuzzy comparison, `LYRICS` → `UNSYNCEDLYRICS` derivation — `core.py`. |
+| `build_get_params()` / `entry_expired()` / `resolve_asset()` | Pure validations — `core.py`: `/api/get` query conforming to the LRCLIB docs (empty params purged, `duration` bounded to 1–3600), cache TTL (3 d / 30 d), optional asset. |
+| `scaled_size()` / `opening_geometry()` | Real-pixel startup size and exact centering — `core.py` (DPI conversion, physical-pixel position, frame border). |
+| `_score_entry()` / `_search_queries()` | `/api/search` fallback: local duration as the deciding factor (±2 s) + structured `track_name`+`artist_name` query. |
+| `_set_app_user_model_id()` / `_load_logo()` | App identity and logo: `AppUserModelID` before the window (taskbar icon instead of the Py logo), `Logo.png` in the title bar and header. |
 | `_collect_flac()`                    | Recursive scan + inode-based deduplication (hardlinks/duplicates).  |
 | `process_file()` / `run()`           | **Injection** mode logic (START) on a file / a batch.               |
 | `check_one()` / `check_files()`      | **Audit/repair** mode logic (CHECK) on a file / a batch.            |
 | `log()` / `_flush_log()`             | Log queue + batched rendering to the `Text` widget, colored per tag (optional `LRC_LOG_FILE`). |
-| `_wait_token()` / `_rate_limit_pause()` / `_api_get()` | Rate policy: optional token bucket (COOL, ~10 req/s) and coordinated pause on `429` honoring `Retry-After` (all modes). |
+| `_LIM.acquire()` / `_rate_limit_pause()` / `_api_get()` / `set_rate_ceiling()` | Rate policy: shared smoothed token bucket (`RateLimiter`), ceiling set by the slider, `429`/`5xx` fallback honoring `Retry-After` and halving the rate. |
 | `start_pulse()` / `stop_pulse()` / `update_progress()` | Progress bar control (indeterminate then determinate). |
-| `window_v2` / `Palette` / `Body` sections | CustomTkinter UI building (palette matching the `style_v2.css` mock, options/log cards, buttons, status bar). |
-| `diag.bat` + `ctrl_c()` / `raise_soft_exit()` | Startup diagnostics (interpreter, dependencies, trace in `diag.log`) and soft cancellation (`CTRL+C` on terminal interruption). |
+| `window_v2` / `Header` / `Palette` / `Body` sections | CustomTkinter UI building (palette matching the `style_v2.css` mock, logo + app name header, options/log cards, buttons, status bar). |
+| `stop_processing()` / `on_close()` | Cancellation of the running batch (`threading.Event`), cache flush and orderly shutdown. |
 
 ---
 
@@ -320,7 +332,7 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 
 * ` 🔁 `︲**Bounded HTTP retry** (2 attempts, `0.5s` backoff) : tolerates transient API errors without blocking a thread indefinitely.
 
-* ` 🪣 `︲**Token bucket for COOL mode** : smooths the flow to ~10 req/s (packet-based token consumption, under lock) — a steady, burst-free rhythm for LRCLIB.
+* ` 🪣 `︲**Shared token bucket** : smooths the flow under a lock, ceiling adjustable from 1 to 25 req/s — a steady, burst-free rhythm for LRCLIB.
 
 * ` 🎯 `︲**Budgeted fallback search** (12 s max) : the best candidate is selected by combined scoring (artist ratio + title ratio) without ever exceeding the total budget.
 
@@ -337,10 +349,11 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 |--------|-----------|
 | **In-place FLAC writing** (`audio.save()` without temp file) | mutagen 1.46+ does not support `save(tmp)` to a new file — it checks the FLAC header of the output file, which fails on an empty one. In-place `save()` writes the new Vorbis tags at the head of the file. If the Vorbis block changes size (systematically the case with `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` physically shifts the audio data on disk. A crash/power loss *during this shift* can truncate the audio, not just the tags. This is very unlikely (a few-ms window per file), but documented for transparency. For maximum safety, back up your library before batch processing. |
 | **Broad `except Exception`** | GUI application : a silent failure logged with context is better than an unhandled traceback that closes the window. Every error is logged with its context. |
-| **Extracted pure core (`core.py`)** | The pure logic (cleaning, matching, parsing, cache) was extracted from `lrc-inject.py` (~750 lines, GUI + orchestration) — now unit-testable (14 tests). |
+| **Extracted pure core (`core.py`)** | The pure logic (cleaning, matching, parsing, cache, rate limiter, geometry) was extracted from `lrc-inject.py` (GUI + orchestration) — now unit-testable (45 tests). |
 | **`daemon=True` on workers** | The `join(timeout=30)` in `on_close()` leaves time to finish. If the timeout expires, the thread is killed ; the in-place write can leave a file mid-shift in an unstable state. Ideally, wait for the processing to finish before closing the app. |
 | **No-TTL cache** | The `no_sync` and `inst` entries are permanent; "not found" entries expire after **30 days**. The user has a `Clear Cache` button to start from scratch if needed. |
-| **Two API rates** | No fixed rate limiter in the code : **COOL** uses a shared token bucket (~10 req/s), **SPEED** (default) allows bursts and relies on a single coordinated pause on `429` — `Retry-After` always honored. |
+| **Single smoothed API rate** | No more unlimited bursts: a shared token bucket capped by a slider (1 → 25 req/s, 25 by default). On `429`/`503`, `Retry-After` is honored, the rate is halved then climbed back by steps, never above the slider. A transient error is never cached. |
+| **Split cache TTLs** | "Not found" entries (`miss`, e.g. `404`) expire after **3 days** (LRCLIB picks missing tracks up in the background); "found without synced lyrics" (`no_sync`) after **30 days**; lyrics, instrumental answers and successful lookups stay forever. `Clear Cache` button to start from zero. |
 | **`_save_flac(audio, path)` ignores `path`** | Signature kept for compatibility. `audio.save()` always uses the file's internal path. |
 
 ---

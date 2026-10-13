@@ -12,12 +12,20 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from core import (MATCH_THRESHOLD, RateLimiter, build_get_params, clean, cache_key,
+from core import (MATCH_THRESHOLD, DURATION_TOL, RateLimiter, LookupResult,
+                  build_get_params, clean, cache_key,
                   clear_cache as _purge_cache, entry_expired,
-                  fold, get_fuzz, match, opening_geometry, resolve_asset,
-                  strip_timestamps,
+                  fold, get_fuzz, last_timestamp, match, meets_threshold,
+                  opening_geometry, parse_manual_lyrics, resolve_asset,
+                  similarity, strip_timestamps,
                   _cache, _cache_lock,
                   _mark_dirty, _parse_result, _save_cache, set_logger as _set_logger)
+
+_DEBUG = os.environ.get("LRC_DEBUG") == "1"
+
+def _dbg(msg):
+    if _DEBUG:
+        log(f"[DEBUG] {msg}")
 
 LRCLIB_API = "https://lrclib.net/api/get"
 SESSION = None
@@ -63,18 +71,25 @@ def _api_error(r):
 
 # ponytail: débit unique lissé à RATE_MAX (curseur), abaissé automatiquement
 # sur 429/5xx via Retry-After puis remonté après une série de succès.
-def _api_get(url, params=None, timeout=None):
+def _api_get(url, params=None, timeout=None, timing=None):
     """Rend la réponse après avoir lissé le débit et réessayé les erreurs
     transitoires. Un 429/5xx est réessayé _MAX_ATTEMPTS fois en honorant
     Retry-After, en divisant le débit par deux à chaque tentative. Au terme,
     la dernière réponse est rendue telle quelle : l'appelant doit alors
     ne rien mettre en cache, une erreur transitoire n'est pas un verdict.
+
+    timing optionnel : dict où l'on cumule le temps HTTP réellement passé
+    (hors pauses rate-limit), pour que le budget de recherche ne soit pas
+    consommé par l'attente.
     """
     r = None
     for _ in range(_MAX_ATTEMPTS):
         _LIM.acquire(cancel=_cancel.is_set)
         _rate_limit_pause()
+        t = time.time()
         r = get_session().get(url, params=params, timeout=timeout)
+        if timing is not None:
+            timing["http"] = timing.get("http", 0.0) + (time.time() - t)
         if r.status_code not in TRANSIENT:
             _LIM.on_success()
             return r
@@ -140,6 +155,13 @@ def _stat_miss():
     global _cache_misses
     with _stat_lock:
         _cache_misses += 1
+
+_bini_ok = 0
+
+def _stat_bini():
+    global _bini_ok
+    with _stat_lock:
+        _bini_ok += 1
 
 _log_buffer = []
 _log_lock = Lock()
@@ -228,6 +250,23 @@ def _flush_log():
 _pulsing = False
 _cancel = threading.Event()
 _worker_thread = None
+_failed_paths = []
+
+def _set_failed_paths(paths):
+    """File des échecs du dernier lot (miss/reject/retry) pour le mode manuel."""
+    global _failed_paths
+    _failed_paths = list(paths)
+    n = len(_failed_paths)
+
+    def _upd():
+        try:
+            manual_btn.configure(text=f"MANUAL ({n})" if n else "MANUAL")
+        except NameError:
+            pass
+    try:
+        root.after(0, _upd)
+    except Exception:
+        pass
 
 def start_pulse():
     global _pulsing
@@ -271,8 +310,6 @@ def update_progress(val, maxv):
 
 SEARCH_API = "https://lrclib.net/api/search"
 _FALLBACK_BUDGET = 12.0
-_DURATION_TOL = 2.0
-_DURATION_WEIGHT = MATCH_THRESHOLD * 2
 
 def _search_queries(artist, title):
     queries = []
@@ -286,138 +323,336 @@ def _search_queries(artist, title):
         queries.append({"track_name": title.strip(), "artist_name": artist.strip()})
     return queries
 
-def _score_entry(entry, ca, ct, duration):
-    """Score de pertinence d'un résultat de recherche.
+def _score_entry(entry, artist, title, duration):
+    """Deux niveaux (phase 1.4) + infos de classement.
 
-    Le titre et l'artiste ouvrent la porte (seuil de similarité), puis la
-    durée départage les versions : c'est le même critère que celui qu'utilise
-    /api/get (±2 s), et sans lui un live ou un remaster gagne trop souvent.
+    Rend {entry, ra, rt, delta} si le candidat passe le seuil, sinon None.
+    Le classement (durée d'abord, puis ra+rt) est fait par _rank.
     """
-    fuzz = get_fuzz()
-    ra = fuzz.ratio(ca, clean(entry.get("artistName", "")))
-    rt = fuzz.ratio(ct, clean(entry.get("trackName", "")))
-    if ra < MATCH_THRESHOLD or rt < MATCH_THRESHOLD:
-        return None
-    score = ra + rt
+    ra = similarity(entry.get("artistName", ""), artist)
+    rt = similarity(entry.get("trackName", ""), title)
     remote = entry.get("duration")
-    if duration and isinstance(remote, (int, float)):
+    delta = None
+    if isinstance(duration, (int, float)) and isinstance(remote, (int, float)):
         delta = abs(remote - duration)
-        score += _DURATION_WEIGHT if delta <= _DURATION_TOL else max(0.0, 20.0 - delta)
-    return score
+    if not meets_threshold(ra, rt, delta):
+        return None
+    return {"entry": entry, "ra": ra, "rt": rt, "delta": delta}
+
+def _rank(c):
+    """Clé de tri : synchronisé avant instrumental avant plain, puis durée
+    (écart <= 2 s d'abord), puis ra + rt décroissant."""
+    kind = 0 if c.get("lrc") else (1 if c.get("inst") else 2)
+    far = 0 if (c.get("delta") is not None and c["delta"] <= DURATION_TOL) else 1
+    delta = c["delta"] if c.get("delta") is not None else 0.0
+    return (kind, far, delta, -(c["ra"] + c["rt"]))
+
+def _entry_from_candidate(c):
+    e = c["entry"]
+    return {"lrc": c.get("lrc"), "inst": c.get("inst", False),
+            "a": e.get("artistName"), "t": e.get("trackName"), "pl": c.get("plain")}
+
+def _store_best(candidates, key):
+    c = min(candidates, key=_rank)
+    if c.get("delta") is not None and c["delta"] > DURATION_TOL:
+        log(f"[WARN] écart de durée {c['delta']:.1f}s retenu en dernier recours "
+            f"({c['entry'].get('artistName')} - {c['entry'].get('trackName')})")
+    if c.get("lrc"):
+        with _cache_lock:
+            _cache[key] = _entry_from_candidate(c)
+        _mark_dirty()
+        return LookupResult(LookupResult.FOUND, lrc=c["lrc"], raw=c["entry"],
+                            inst=c.get("inst", False), plain=c.get("plain"))
+    if c.get("inst"):
+        with _cache_lock:
+            _cache[key] = _entry_from_candidate(c)
+        _mark_dirty()
+        return LookupResult(LookupResult.FOUND, lrc=None, raw=c["entry"],
+                            inst=True, plain=c.get("plain"))
+    entry = _entry_from_candidate(c)
+    entry["no_sync"] = True
+    entry["ts"] = time.time()
+    with _cache_lock:
+        _cache[key] = entry
+    _mark_dirty()
+    return LookupResult(LookupResult.FOUND, lrc=None, raw=c["entry"],
+                        inst=False, plain=c.get("plain"))
 
 def _search_fallback(artist, title, key, duration=None):
-    ca, ct = clean(artist), clean(title)
-    best_lrc = None
-    best_plain = None
-    score_lrc = -1
-    score_plain = -1
-    t0 = time.time()
-    for params in _search_queries(artist, title):
-        remaining = _FALLBACK_BUDGET - (time.time() - t0)
-        if remaining <= 0:
-            break
-        try:
-            s = _api_get(SEARCH_API, params=params, timeout=min(8, remaining))
-            if s.status_code != 200:
-                continue
-            for entry in s.json():
-                score = _score_entry(entry, ca, ct, duration)
-                if score is None:
-                    continue
-                lrc, inst = _parse_result(entry)
-                if lrc and score > score_lrc:
-                    best_lrc = (lrc, entry, inst)
-                    score_lrc = score
-                elif not lrc and score > score_plain:
-                    best_plain = (lrc, entry, inst)
-                    score_plain = score
-        except Exception:
-            continue
-    if best_lrc:
-        lrc, entry, inst = best_lrc
-        with _cache_lock:
-            _cache[key] = {"lrc": lrc, "inst": inst,
-                           "a": entry.get("artistName"), "t": entry.get("trackName"),
-                           "pl": entry.get("plainLyrics")}
-        _mark_dirty()
-        return lrc, entry, inst
-    if best_plain:
-        lrc, entry, inst = best_plain
-        with _cache_lock:
-            _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
-                           "a": entry.get("artistName"), "t": entry.get("trackName"),
-                           "pl": entry.get("plainLyrics"), "ts": time.time()}
-        _mark_dirty()
-        return None, entry, False
-    with _cache_lock:
-        _cache[key] = {"lrc": None, "inst": False, "miss": True,
-                       "pl": None, "ts": time.time()}
-    _mark_dirty()
-    return None, None, False
+    """Recherche /api/search à statut tri-état (phase 1.1).
 
-def fetch_lrc(artist, title, album="", duration=None):
+    FOUND : candidat valide retenu. NOT_FOUND : toutes les requêtes ont
+    abouti (200) sans candidat — seul cas caché comme miss. INCONCLUSIVE :
+    au moins une requête a échoué (non-200, exception, budget épuisé) —
+    rien n'est mis en cache, on retentera plus tard.
+    """
+    candidates = []
+    failed = 0
+    budget = _FALLBACK_BUDGET
+    for params in _search_queries(artist, title):
+        if budget <= 0:
+            failed += 1
+            _dbg(f"budget épuisé avant {params}")
+            break
+        timing = {}
+        t1 = time.time()
+        try:
+            s = _api_get(SEARCH_API, params=params,
+                         timeout=min(8.0, max(0.5, budget)), timing=timing)
+        except Exception as e:
+            failed += 1
+            _dbg(f"search {params} -> exception {e!r}")
+            continue
+        budget -= timing.get("http", time.time() - t1)
+        code = getattr(s, "status_code", None)
+        if code != 200:
+            failed += 1
+            _dbg(f"search {params} -> HTTP {code}")
+            continue
+        try:
+            data = s.json()
+        except Exception:
+            failed += 1
+            continue
+        if not isinstance(data, list):
+            data = []
+        _dbg(f"search {params} -> 200, {len(data)} résultat(s)")
+        for entry in data:
+            info = _score_entry(entry, artist, title, duration)
+            if info is None:
+                _dbg(f"  reject {entry.get('artistName')} - {entry.get('trackName')} "
+                     f"({entry.get('duration')})")
+                continue
+            lrc, inst = _parse_result(entry)
+            if lrc and duration:
+                lt = last_timestamp(lrc)
+                if lt is not None and lt > duration + 3:
+                    _dbg(f"  reject {entry.get('trackName')} : dernier ts "
+                         f"{lt:.1f}s > {duration + 3:.1f}s")
+                    continue
+            info["lrc"] = lrc
+            info["inst"] = inst
+            info["plain"] = entry.get("plainLyrics")
+            _dbg(f"  accept {entry.get('artistName')} - {entry.get('trackName')} "
+                 f"({entry.get('duration')}) ra={info['ra']:.0f} rt={info['rt']:.0f} "
+                 f"delta={info['delta']}")
+            candidates.append(info)
+        if any(c.get("lrc") and (c.get("delta") is None or c["delta"] <= DURATION_TOL)
+               for c in candidates):
+            break
+    if candidates:
+        return _store_best(candidates, key)
+    if failed == 0:
+        with _cache_lock:
+            _cache[key] = {"lrc": None, "inst": False, "miss": True,
+                           "pl": None, "ts": time.time()}
+        _mark_dirty()
+        return LookupResult(LookupResult.NOT_FOUND)
+    return LookupResult(LookupResult.INCONCLUSIVE)
+
+def _try_get(params, artist, title, duration):
+    """Un appel /api/get -> (kind, data).
+
+    kind ∈ synced / plain / inst / notfound / transient / error.
+    """
+    try:
+        r = _api_get(LRCLIB_API, params=params, timeout=(3, 8))
+    except Exception as e:
+        _dbg(f"get {params} -> exception {e!r}")
+        return "transient", None
+    code = getattr(r, "status_code", None)
+    _dbg(f"get {params} -> HTTP {code}")
+    if code == 200:
+        try:
+            data = r.json()
+        except Exception:
+            return "transient", None
+        lrc, inst = _parse_result(data)
+        if lrc:
+            lt = last_timestamp(lrc)
+            if duration and lt is not None and lt > duration + 3:
+                log(f"[WARN] /api/get {artist} - {title} : dernier timestamp "
+                    f"{lt:.1f}s > durée+3s, écarté")
+                return "notfound", None
+            return "synced", data
+        if inst:
+            return "inst", data
+        return "plain", data
+    if code == 404:
+        return "notfound", None
+    if code == 400:
+        log(f"[ERROR] /api/get 400 sur {artist} - {title} : {_api_error(r)}")
+        return "error", None
+    return "transient", None
+
+def _cache_synced(key, data, duration):
+    lrc, inst = _parse_result(data)
+    with _cache_lock:
+        _cache[key] = {"lrc": lrc, "inst": inst,
+                       "a": data.get("artistName"), "t": data.get("trackName"),
+                       "pl": data.get("plainLyrics")}
+    _mark_dirty()
+    return LookupResult(LookupResult.FOUND, lrc=lrc, raw=data, inst=inst,
+                        plain=data.get("plainLyrics"))
+
+def _cache_inst(key, data):
+    with _cache_lock:
+        _cache[key] = {"lrc": None, "inst": True,
+                       "a": data.get("artistName"), "t": data.get("trackName"),
+                       "pl": data.get("plainLyrics")}
+    _mark_dirty()
+    return LookupResult(LookupResult.FOUND, lrc=None, raw=data, inst=True,
+                        plain=data.get("plainLyrics"))
+
+def _cache_plain(key, data, duration):
+    pl = data.get("plainLyrics")
+    with _cache_lock:
+        _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
+                       "a": data.get("artistName"), "t": data.get("trackName"),
+                       "pl": pl, "ts": time.time()}
+    _mark_dirty()
+    return LookupResult(LookupResult.FOUND, lrc=None, raw=data, inst=False, plain=pl)
+
+def _cached_result(c):
+    raw = {"artistName": c.get("a"), "trackName": c.get("t"),
+           "plainLyrics": c.get("pl")}
+    if c.get("lrc"):
+        return LookupResult(LookupResult.FOUND, lrc=c["lrc"], raw=raw,
+                            inst=c.get("inst", False), plain=c.get("pl"),
+                            src=c.get("src"))
+    if c.get("inst"):
+        return LookupResult(LookupResult.FOUND, lrc=None, raw=raw, inst=True,
+                            plain=c.get("pl"), src=c.get("src"))
+    if c.get("no_sync") and c.get("pl"):
+        return LookupResult(LookupResult.FOUND, lrc=None, raw=raw, inst=False,
+                            plain=c.get("pl"), src=c.get("src"))
+    return LookupResult(LookupResult.NOT_FOUND)
+
+_BINI = None
+
+def _get_bini_provider():
+    global _BINI
+    if _BINI is None:
+        from providers.bini import BiniProvider
+        _BINI = BiniProvider(log=log)
+    return _BINI
+
+def _bini_lookup(artist, title, album, duration, isrc=None):
+    """BiniLyrics avec cache préfixé "bini:" (mêmes règles que LRCLIB)."""
+    key = "bini:" + cache_key(artist, title, album)
+    drop = False
+    with _cache_lock:
+        c = _cache.get(key)
+        if c is not None:
+            if entry_expired(c, time.time()):
+                _cache.pop(key, None)
+                drop = True
+            else:
+                _stat_hit()
+                return _cached_result(c)
+    if drop:
+        _mark_dirty()
+    res = _get_bini_provider().search(artist, title, album, duration, isrc)
+    if res.status == LookupResult.FOUND and res.lrc:
+        raw = res.raw or {}
+        with _cache_lock:
+            _cache[key] = {"lrc": res.lrc, "inst": False, "src": "bini",
+                           "a": raw.get("artistName"), "t": raw.get("trackName"),
+                           "pl": None}
+        _mark_dirty()
+        res.src = "bini"
+    return res
+
+def fetch_lrc_ex(artist, title, album="", duration=None, force_upgrade=False,
+                 bini=False, isrc=None):
+    """Résolution tri-état d'une piste (phase 1.1/1.2).
+
+    cache, puis cascade /api/get (complet, puis sans album si album fourni),
+    puis /api/search. Un plain issu de /api/get sert de repli si la recherche
+    ne trouve rien de synchronisé. Rien n'est mis en cache sur INCONCLUSIVE.
+    bini activé : BiniLyrics n'est interrogé QUE sur NOT_FOUND ou plain-only,
+    jamais sur INCONCLUSIVE.
+    """
     key = cache_key(artist, title, album)
-    deleted = False
+    drop = False
     with _cache_lock:
         if key in _cache:
-            _stat_hit()
             c = _cache[key]
-            if entry_expired(c, time.time()):
-                del _cache[key]
-                deleted = True
-            elif c.get("lrc"):
-                return c["lrc"], {"artistName": c["a"], "trackName": c["t"], "plainLyrics": c.get("pl")}, c.get("inst", False)
-            elif c.get("inst"):
-                return None, None, True
-            elif c.get("no_sync") or c.get("miss"):
-                if c.get("pl"):
-                    return None, {"artistName": c.get("a"), "trackName": c.get("t"), "plainLyrics": c.get("pl")}, False
-                return None, None, False
+            upgrade = force_upgrade and c.get("no_sync") and not c.get("lrc")
+            if upgrade or entry_expired(c, time.time()):
+                _cache.pop(key, None)
+                drop = True
             else:
-                del _cache[key]
-                deleted = True
-    if deleted:
+                _stat_hit()
+                return _cached_result(c)
+    if drop:
         _mark_dirty()
-    try:
-        params, dropped = build_get_params(artist, title, album, duration)
-        if params is None:
-            log(f"[ERROR] Signature inexploitable (artiste ou titre vide) : "
-                f"{artist!r} - {title!r}")
-            return None, None, False
-        _stat_miss()
-        if dropped:
-            log(f"[WARN] /api/get : {', '.join(dropped)} ignoré pour {artist} - {title}")
-        r = _api_get(LRCLIB_API, params=params, timeout=(3, 8))
-        if r.status_code == 200:
-            data = r.json()
-            lrc, inst = _parse_result(data)
-            if lrc or inst:
-                with _cache_lock:
-                    _cache[key] = {"lrc": lrc, "inst": inst,
-                                   "a": data.get("artistName"), "t": data.get("trackName"),
-                                   "pl": data.get("plainLyrics")}
-                _mark_dirty()
-                return lrc, data, inst
-            with _cache_lock:
-                _cache[key] = {"lrc": None, "inst": False, "no_sync": True,
-                               "a": data.get("artistName"), "t": data.get("trackName"),
-                               "pl": data.get("plainLyrics"), "ts": time.time()}
-            _mark_dirty()
-            return None, data, False
 
-        if r.status_code == 404:
-            return _search_fallback(artist, title, key, duration)
-        if r.status_code == 400:
-            log(f"[ERROR] /api/get 400 sur {artist} - {title} : {_api_error(r)}")
-            return None, None, False
-        log(f"[WARN] /api/get {r.status_code} sur {artist} - {title} "
-            f"— abandon, rien mis en cache (erreur transitoire)")
-        return None, None, False
-    except Exception:
-        lrc, data, inst = _search_fallback(artist, title, key, duration)
-        if lrc or inst:
-            return lrc, data, inst
-        return None, None, False
+    params, dropped = build_get_params(artist, title, album, duration)
+    if params is None:
+        log(f"[ERROR] Signature inexploitable (artiste ou titre vide) : "
+            f"{artist!r} - {title!r}")
+        return LookupResult(LookupResult.INCONCLUSIVE)
+    _stat_miss()
+    if dropped:
+        log(f"[WARN] /api/get : {', '.join(dropped)} ignoré pour {artist} - {title}")
+
+    plain_candidate = None
+    kind, data = _try_get(params, artist, title, duration)
+    if kind == "synced":
+        return _cache_synced(key, data, duration)
+    if kind == "inst":
+        return _cache_inst(key, data)
+    if kind == "plain":
+        plain_candidate = data
+    if kind in ("transient", "error"):
+        return LookupResult(LookupResult.INCONCLUSIVE)
+
+    if (album or "").strip():
+        params2, _ = build_get_params(artist, title, "", duration)
+        if params2 is not None:
+            kind2, data2 = _try_get(params2, artist, title, duration)
+            if kind2 == "synced":
+                return _cache_synced(key, data2, duration)
+            if kind2 == "inst":
+                return _cache_inst(key, data2)
+            if kind2 == "plain":
+                plain_candidate = data2
+            if kind2 in ("transient", "error"):
+                return LookupResult(LookupResult.INCONCLUSIVE)
+
+    res = _search_fallback(artist, title, key, duration)
+    if res.status == LookupResult.INCONCLUSIVE:
+        return res
+    if res.status == LookupResult.NOT_FOUND and plain_candidate is not None:
+        res = _cache_plain(key, plain_candidate, duration)
+    if bini and (res.status == LookupResult.NOT_FOUND
+                 or (res.status == LookupResult.FOUND and not res.lrc and res.plain)):
+        bres = _bini_lookup(artist, title, album, duration, isrc)
+        if bres.status == LookupResult.FOUND and bres.lrc:
+            return bres
+    return res
+
+def fetch_lrc(artist, title, album="", duration=None):
+    """Wrapper rétro-compatible : rend le tuple (lrc, raw, inst)."""
+    res = fetch_lrc_ex(artist, title, album, duration)
+    return res.lrc, res.raw, res.inst
+
+def _drop_cache(artist, title, album):
+    k = cache_key(artist, title, album)
+    with _cache_lock:
+        _cache.pop(k, None)
+    _mark_dirty()
+
+def _candidate_detail(raw, artist, title):
+    ra = similarity(raw.get("artistName", ""), artist)
+    rt = similarity(raw.get("trackName", ""), title)
+    return (f"{raw.get('artistName')} - {raw.get('trackName')} "
+            f"({raw.get('duration')}) ra={ra:.0f} rt={rt:.0f}")
+
+def _similarity_ok(raw, artist, title):
+    return (similarity(raw.get("artistName", ""), artist) >= MATCH_THRESHOLD and
+            similarity(raw.get("trackName", ""), title) >= MATCH_THRESHOLD)
 
 def process_file(path):
     FLAC = get_flac_cls()
@@ -435,36 +670,42 @@ def process_file(path):
         if _first_tag(audio, "LYRICS").strip() or _first_tag(audio, "UNSYNCEDLYRICS").strip():
             return ("skip", title, "already has lyrics")
 
-        lrc, raw, inst = fetch_lrc(artist, title, album, getattr(audio.info, "length", None))
-        if inst or re.search(r"instrumental", title, re.I):
+        isrc = _first_tag(audio, "isrc") or _first_tag(audio, "ISRC") or None
+        res = fetch_lrc_ex(artist, title, album, getattr(audio.info, "length", None),
+                           bini=bini_enabled.get(), isrc=isrc)
+        if res.inst or re.search(r"instrumental", title, re.I):
             return ("inst", title, None)
-        if not lrc:
-            if raw and raw.get("plainLyrics"):
-                if not match(artist, raw.get("artistName", "")) or not match(title, raw.get("trackName", "")):
-                    return ("reject", title, None)
-                audio["UNSYNCEDLYRICS"] = raw["plainLyrics"]
-                if not _save_flac(audio, path):
-                    k = cache_key(artist, title, album)
-                    with _cache_lock:
-                        _cache.pop(k, None)
-                    _mark_dirty()
-                    return ("error", title, "cannot write file (corrupted?)")
-                return ("ok", title, "plain lyrics")
-            return ("miss", title, None)
-        if not match(artist, raw.get("artistName", "")) or not match(title, raw.get("trackName", "")):
-            return ("reject", title, None)
+        if res.status == LookupResult.INCONCLUSIVE:
+            return ("retry", title, None)
 
-        audio["LYRICS"] = lrc
-        unsynced = strip_timestamps(lrc)
-        if unsynced:
-            audio["UNSYNCEDLYRICS"] = unsynced
-        if not _save_flac(audio, path):
-            k = cache_key(artist, title, album)
-            with _cache_lock:
-                _cache.pop(k, None)
-            _mark_dirty()
-            return ("error", title, "cannot write file (corrupted?)")
-        return ("ok", title, None)
+        raw = res.raw or {}
+        if res.lrc:
+            if not _similarity_ok(raw, artist, title):
+                return ("reject", title, _candidate_detail(raw, artist, title))
+            audio["LYRICS"] = res.lrc
+            unsynced = strip_timestamps(res.lrc)
+            if unsynced:
+                audio["UNSYNCEDLYRICS"] = unsynced
+            if not _save_flac(audio, path):
+                _drop_cache(artist, title, album)
+                return ("error", title, "cannot write file (corrupted?)")
+            if res.src == "bini":
+                _stat_bini()
+                return ("ok", title, "bini")
+            return ("ok", title, None)
+
+        if res.plain:
+            if not _similarity_ok(raw, artist, title):
+                return ("reject", title, _candidate_detail(raw, artist, title))
+            audio["UNSYNCEDLYRICS"] = res.plain
+            if not _save_flac(audio, path):
+                _drop_cache(artist, title, album)
+                return ("error", title, "cannot write file (corrupted?)")
+            return ("plain", title, None)
+
+        if res.status == LookupResult.NOT_FOUND:
+            return ("miss", title, None)
+        return ("retry", title, None)
     except Exception as e:
         return ("error", path, str(e))
 
@@ -499,24 +740,28 @@ def _collect_flac(folder):
     return unique
 
 def run(folder, workers):
-    global _last_prog, _cache_hits, _cache_misses
+    global _last_prog, _cache_hits, _cache_misses, _bini_ok
     _cancel.clear()
     _last_prog = 0
     _cache_hits = 0
     _cache_misses = 0
+    _bini_ok = 0
+    _set_failed_paths([])
     t0 = time.time()
     start_pulse()
     try:
         files = _collect_flac(folder)
         if os.path.isfile(folder) and not files:
             return
-        stats = {"ok":0,"miss":0,"reject":0,"skip":0,"error":0,"inst":0}
+        stats = {"ok":0,"plain":0,"retry":0,"miss":0,"reject":0,"skip":0,"error":0,"inst":0}
         total = len(files)
         log(f"Files: {total} | Threads: {workers}")
 
+        failed_paths = []
         cancelled = False
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(process_file, f) for f in files]
+            path_of = {futures[i]: files[i] for i in range(len(files))}
             for i, fu in enumerate(as_completed(futures), 1):
                 if _cancel.is_set():
                     for f in futures:
@@ -525,23 +770,31 @@ def run(folder, workers):
                     break
                 status, name, extra = fu.result()
                 stats[status] += 1
+                if status in ("miss", "reject", "retry"):
+                    failed_paths.append(path_of.get(fu))
                 if status == "ok":
                     log(f"[OK] {name}" + (f" -> {extra}" if extra else ""))
+                elif status == "plain":
+                    log(f"[PLAIN] {name}")
                 elif status == "inst":
                     log(f"[INST] {name}")
+                elif status == "retry":
+                    log(f"[RETRY] {name}")
                 elif status == "miss":
                     log(f"[MISS] {name}")
                 elif status == "reject":
-                    log(f"[REJECT] {name}")
+                    log(f"[REJECT] {name}" + (f" -> {extra}" if extra else ""))
                 elif status == "skip":
                     log(f"[SKIP] {name}" + (f" -> {extra}" if extra else ""))
                 else:
                     log(f"[ERROR] {name} -> {extra}")
                 update_progress(i, total)
+        _set_failed_paths([p for p in failed_paths if p])
 
         log("\n=== STATS ===")
         for k, v in stats.items():
             log(f"{k.upper()}: {v}")
+        log(f"BINI: {_bini_ok}")
         tot = _cache_hits + _cache_misses
         rate = f"{_cache_hits / tot * 100:.0f}%" if tot else "n/a"
         log(f"Durée: {time.time() - t0:.1f}s | Cache: {_cache_hits} hits / {_cache_misses} appels API ({rate})")
@@ -561,6 +814,7 @@ def _set_busy(b):
     check_btn.configure(state=state)
     stop_btn.configure(state="normal" if b else "disabled")
     clear_cache_btn.configure(state=state)
+    manual_btn.configure(state=state)
 
 def stop_processing():
     _cancel.set()
@@ -631,15 +885,23 @@ def check_one(path):
             if not artist or not title:
                 return ("partial", f"[PARTIEL] {name} -> pas d'artiste/titre")
             album = _first_tag(audio, "album")
-            lrc, raw, inst = fetch_lrc(artist, title, album, getattr(audio.info, "length", None))
-            if inst or re.search(r"instrumental", title, re.I):
+            isrc = _first_tag(audio, "isrc") or _first_tag(audio, "ISRC") or None
+            res = fetch_lrc_ex(artist, title, album,
+                               getattr(audio.info, "length", None), force_upgrade=True,
+                               bini=bini_enabled.get(), isrc=isrc)
+            if res.inst or re.search(r"instrumental", title, re.I):
                 return ("inst", f"[INST] {name} -> instrumental")
-            if lrc and match(artist, raw.get("artistName", "")) and match(title, raw.get("trackName", "")):
-                audio["LYRICS"] = lrc
+            if res.status == LookupResult.INCONCLUSIVE:
+                return ("retry", f"[RETRY] {name} -> API indisponible")
+            if res.lrc and _similarity_ok(res.raw or {}, artist, title):
+                audio["LYRICS"] = res.lrc
                 if not _save_flac(audio, path):
                     return ("error", f"[ERREUR] {name} -> cannot write file")
+                if res.src == "bini":
+                    _stat_bini()
+                    return ("repair", f"[OK] {name} -> bini")
                 return ("repair", f"[RÉPARÉ] {name} -> LYRICS ajouté")
-            if lrc:
+            if res.lrc:
                 return ("partial", f"[PARTIEL] {name} -> rejeté par similarité")
             return ("partial", f"[PARTIEL] {name} -> introuvable sur l'API")
         return ("missing", f"[MANQUE] {name} -> aucun tag")
@@ -652,6 +914,7 @@ def check_files(folder):
     _last_prog = 0
     _cache_hits = 0
     _cache_misses = 0
+    _set_failed_paths([])
     t0 = time.time()
     log("[INFO] CHECK & REPAIR mode: files will be modified (tags added/fixed)")
     start_pulse()
@@ -670,18 +933,25 @@ def check_files(folder):
             workers = min(CPU_COUNT, 16)
         thread_var.set(str(workers))
         cancelled = False
+        failed_paths = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(check_one, f) for f in files]
+            path_of = {futures[i]: files[i] for i in range(len(files))}
             for i, fu in enumerate(as_completed(futures), 1):
                 if _cancel.is_set():
                     for f in futures:
                         f.cancel()
                     cancelled = True
                     break
-                lines.append(fu.result())
+                st, _msg = fu.result()
+                if st in ("retry", "partial", "missing"):
+                    failed_paths.append(path_of.get(fu))
+                lines.append((st, _msg))
                 update_progress(i, total)
+        _set_failed_paths([p for p in failed_paths if p])
 
-        order = {"ok": 0, "repair": 1, "error": 2, "inst": 3, "partial": 4, "missing": 5}
+        order = {"ok": 0, "repair": 1, "error": 2, "inst": 3, "retry": 4,
+                 "partial": 5, "missing": 6}
         lines.sort(key=lambda x: order.get(x[0], 9))
         ok = sum(1 for t, _ in lines if t == "ok")
         fixed = sum(1 for t, _ in lines if t == "repair")
@@ -748,6 +1018,110 @@ def pick_file():
     p = filedialog.askopenfilename(filetypes=[("FLAC files", "*.flac")])
     if p:
         folder_var.set(p)
+
+# ── Injection manuelle (phase 2.3/2.4) ──
+def _manual_target_path():
+    p = folder_var.get()
+    if p and p != "Sélectionner un dossier ou fichier..." and os.path.isfile(p) \
+            and p.lower().endswith(".flac"):
+        return p
+    return filedialog.askopenfilename(filetypes=[("FLAC files", "*.flac")]) or None
+
+def manual_inject():
+    if _worker_thread and _worker_thread.is_alive():
+        log("[ERROR] Injection manuelle refusée pendant un lot")
+        return
+    if _failed_paths:
+        path = _failed_paths.pop(0)
+        _set_failed_paths(_failed_paths)
+    else:
+        path = _manual_target_path()
+    if not path:
+        return
+    _open_manual_window(path)
+
+def _open_manual_window(path):
+    FLAC = get_flac_cls()
+    try:
+        audio = FLAC(path)
+    except Exception as e:
+        log(f"[ERREUR] {os.path.basename(path)} -> {e}")
+        return
+    artist = _first_tag(audio, "artist") or "?"
+    title = _first_tag(audio, "title") or os.path.basename(path)
+    album = _first_tag(audio, "album")
+    dur = getattr(audio.info, "length", None)
+    has_l = bool(_first_tag(audio, "LYRICS").strip())
+    has_u = bool(_first_tag(audio, "UNSYNCEDLYRICS").strip())
+
+    win = ctk.CTkToplevel(root)
+    win.title("Injection manuelle")
+    win.geometry("620x500")
+    win.transient(root)
+    win.grab_set()
+
+    dur_txt = f" ({dur:.0f}s)" if dur else ""
+    head = ctk.CTkFrame(win, fg_color="transparent")
+    head.pack(fill="x", padx=20, pady=(18, 6))
+    ctk.CTkLabel(head, text=f"{artist} - {title}{dur_txt}", font=F_ACC,
+                 text_color=TXT, anchor="w").pack(anchor="w")
+    presence = (f"LYRICS: {'oui' if has_l else 'non'}   |   "
+                f"UNSYNCEDLYRICS: {'oui' if has_u else 'non'}")
+    ctk.CTkLabel(head, text=presence, font=F_SUB, text_color=TXT_MUT,
+                 anchor="w").pack(anchor="w", pady=(2, 0))
+
+    ctk.CTkLabel(win, text="Veuillez coller ici le LRC que vous souhaitez "
+                 "injecter dans le fichier", font=F_UI, text_color=TXT_SEC,
+                 anchor="w").pack(fill="x", padx=20, pady=(6, 4))
+    box = ctk.CTkTextbox(win, wrap="none", font=F_LOG, fg_color=BG_IN,
+                         text_color="#d8dae0", border_width=1, border_color=BORDER_IN,
+                         corner_radius=MD)
+    box.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+
+    def do_inject():
+        r = parse_manual_lyrics(box.get("1.0", "end"), duration=dur)
+        if r["kind"] == "empty":
+            messagebox.showwarning("Injection manuelle", "Aucun contenu à injecter.")
+            return
+        if r["warnings"]:
+            if not messagebox.askyesno("Avertissement",
+                                       "\n".join(r["warnings"]) + "\n\nContinuer ?"):
+                return
+        if r["kind"] == "plain":
+            if not messagebox.askyesno(
+                    "Texte non synchronisé",
+                    "Aucun timestamp détecté.\nÉcrire ce texte dans UNSYNCEDLYRICS "
+                    "uniquement ?"):
+                return
+            if has_u and not messagebox.askyesno(
+                    "Écraser", "UNSYNCEDLYRICS existe déjà. Écraser ?"):
+                return
+            audio["UNSYNCEDLYRICS"] = r["plain"]
+        else:
+            if has_l and not messagebox.askyesno(
+                    "Écraser", "LYRICS existe déjà. Écraser ?"):
+                return
+            audio["LYRICS"] = r["lrc"]
+            if r["plain"]:
+                audio["UNSYNCEDLYRICS"] = r["plain"]
+        if not _save_flac(audio, path):
+            log(f"[ERREUR] {title} -> écriture impossible")
+            return
+        k = cache_key(artist, title, album)
+        with _cache_lock:
+            _cache.pop(k, None)
+        _mark_dirty()
+        log(f"[OK] {title} -> manuel")
+        win.destroy()
+
+    btns = ctk.CTkFrame(win, fg_color="transparent")
+    btns.pack(fill="x", padx=20, pady=(0, 18))
+    ctk.CTkButton(btns, text="Injecter", command=do_inject, font=F_ACC,
+                  fg_color=GREEN, hover_color=GREEN_H, text_color=TXT,
+                  corner_radius=MD, height=38, width=130).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(btns, text="Annuler", command=win.destroy, font=F_UI,
+                  fg_color=ELEV, hover_color=ELEV_H, text_color=TXT_SEC,
+                  corner_radius=MD, height=38, width=110).pack(side="right")
 
 # ── DPI Awareness (anti-flou W11) ──
 try:
@@ -950,6 +1324,13 @@ auto_chk = ctk.CTkCheckBox(thr_frame, text="Auto", variable=auto_threads, comman
                            checkmark_color="#0a0a0c", border_color=BORDER_IN,
                            font=F_UI, text_color=TXT)
 auto_chk.pack(side="left", padx=(10, 0))
+bini_enabled = tk.BooleanVar(value=False)
+bini_chk = ctk.CTkCheckBox(thr_frame, text="BiniLyrics fallback", variable=bini_enabled,
+                           checkbox_width=18, checkbox_height=18, corner_radius=4,
+                           fg_color="#f5f5f6", hover_color="#c8c8cd",
+                           checkmark_color="#0a0a0c", border_color=BORDER_IN,
+                           font=F_UI, text_color=TXT)
+bini_chk.pack(side="left", padx=(18, 0))
 
 # API rate
 _opt_label("API rate:", 3)
@@ -993,6 +1374,10 @@ check_btn = ctk.CTkButton(acts, text="CHECK & REPAIR", command=start_check, font
                           fg_color=ELEV, hover_color=ELEV_H, text_color=TXT_SEC,
                           corner_radius=MD, height=42, width=150)
 check_btn.pack(side="left", padx=7)
+manual_btn = ctk.CTkButton(acts, text="MANUAL", command=manual_inject, font=F_ACC,
+                           fg_color=ELEV, hover_color=ELEV_H, text_color=TXT_SEC,
+                           corner_radius=MD, height=42, width=130)
+manual_btn.pack(side="left", padx=7)
 
 # ── Progress ──
 prog_frame = ctk.CTkFrame(main, fg_color="transparent")

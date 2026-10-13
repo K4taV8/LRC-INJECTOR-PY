@@ -14,13 +14,32 @@ from threading import Lock
 MATCH_THRESHOLD = 85
 DURATION_MIN = 1
 DURATION_MAX = 3600
-_NO_SYNC_TTL = 30 * 24 * 3600
+DURATION_TOL = 2.0
+# Une entrée "trouvé mais sans paroles synchronisées" est réessayée au bout
+# de 7 jours : plus court que les 30 jours d'origine, pour laisser une
+# chance à une version synchronisée d'apparaître sans requêter à chaque lot.
+_NO_SYNC_TTL = 7 * 24 * 3600
 _MISS_TTL = 3 * 24 * 3600
 TS_RE = re.compile(r"\[\d+:\d+(?:\.\d+)?\]|<\d+:\d+\.\d+>")
 META_RE = re.compile(r"^\[.*\]$")
 FEAT_RE = re.compile(r"(?<!\w)feat\.(?=\s|$)")
 FT_RE = re.compile(r"(?<!\w)ft\.(?=\s|$)")
 SUFFIXES = ("(remastered)", "(official)", "(audio)")
+
+# Marqueurs de version qui changent la nature de la piste : on ne les retire
+# jamais, et leur présence d'un seul côté interdit le match.
+SIGNIFICANT_MARKERS = ("live", "acoustic", "demo", "remix", "instrumental", "unplugged")
+# Marqueurs purement éditoriaux : ils ne changent pas la chanson, on les retire.
+INSIGNIFICANT_MARKERS = ("explicit", "remastered", "remaster", "deluxe",
+                         "single version", "radio edit", "mono", "stereo",
+                         "official", "audio", "edition", "version")
+_BRACKET_RE = re.compile(r"[\(\[\{]([^\)\]\}]*)[\)\]\}]")
+_REMASTER_SUFFIX_RE = re.compile(r"\s*-\s*remaster(?:ed)?.*$", re.I)
+_FEAT_TAIL_RE = re.compile(r"\b(?:feat|ft|featuring)\.?\b.*$", re.I)
+_FEAT_TOKEN_RE = re.compile(r"\b(?:feat|ft|featuring)\.?\b", re.I)
+_ARTIST_SEP_RE = re.compile(r"\s*(?:;|,|&|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b)\s*", re.I)
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_WS_RE = re.compile(r"\s+")
 
 _FUZZ = None
 
@@ -44,14 +63,139 @@ def clean(t):
 def fold(s):
     return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode()
 
-def match(a, b):
+def _strip_brackets(s):
+    """Retire les crochets non significatifs, conserve les marqueurs de version.
+
+    (Explicit), (Deluxe Edition), (Official Audio) disparaissent ; (Live),
+    (Acoustic) restent pour que "Song (Live)" ne matche pas "Song".
+    """
+    def repl(m):
+        inner = m.group(1).strip().lower()
+        if any(k in inner for k in SIGNIFICANT_MARKERS):
+            return " " + inner + " "
+        if any(k in inner for k in INSIGNIFICANT_MARKERS):
+            return " "
+        return " " + inner + " "
+    return _BRACKET_RE.sub(repl, s)
+
+
+def _normalize(s, drop_feat_tail=True):
+    if not s:
+        return ""
+    s = fold(s).lower()
+    s = _REMASTER_SUFFIX_RE.sub(" ", s)
+    s = _strip_brackets(s)
+    s = s.replace("&", " and ")
+    if drop_feat_tail:
+        s = _FEAT_TAIL_RE.sub(" ", s)
+    else:
+        s = _FEAT_TOKEN_RE.sub(" ", s)
+    s = _PUNCT_RE.sub(" ", s)
+    return _WS_RE.sub(" ", s).strip()
+
+
+def _variants(s):
+    """Formes normalisées candidates d'un libellé.
+
+    On garde la chaîne entière (avec et sans retrait de la queue "feat ...")
+    et chaque artiste séparé par ; , & ou feat, afin de prendre le meilleur
+    appariement sans jamais recourir à token_set_ratio.
+    """
+    s = s or ""
+    out = set()
+    parts = [p for p in _ARTIST_SEP_RE.split(s) if p and p.strip()]
+    for p in (parts or [s]):
+        for drop in (True, False):
+            v = _normalize(p, drop)
+            if v:
+                out.add(v)
+    for drop in (True, False):
+        v = _normalize(s, drop)
+        if v:
+            out.add(v)
+    return out
+
+
+def similarity(a, b):
+    """Similarité 0-100 unifiée (match() et _score_entry la partagent).
+
+    Prend le meilleur ratio (brut ou par mots triés) sur les variantes
+    normalisées. token_sort tolère l'ordre des mots, jamais la présence de
+    mots en trop : "Love" ne matche pas "Love Me Do".
+    """
+    va, vb = _variants(a), _variants(b)
+    if not va or not vb:
+        return 0.0
     fuzz = get_fuzz()
-    ca, cb = clean(a), clean(b)
-    if not ca or not cb:
-        return False
-    return (fuzz.ratio(ca, cb) >= MATCH_THRESHOLD or
-            fuzz.ratio(fold(ca), fold(cb)) >= MATCH_THRESHOLD or
-            fuzz.token_sort_ratio(ca, cb) >= MATCH_THRESHOLD)
+    best = 0.0
+    for x in va:
+        for y in vb:
+            r = fuzz.ratio(x, y)
+            t = fuzz.token_sort_ratio(x, y)
+            if r > best:
+                best = r
+            if t > best:
+                best = t
+    return best
+
+
+def match(a, b):
+    return similarity(a, b) >= MATCH_THRESHOLD
+
+
+def meets_threshold(ra, rt, delta):
+    """Seuil à deux niveaux (phase 1.4).
+
+    Standard : ra et rt >= 85. Repli durée : ra >= 85, rt >= 70 et écart de
+    durée <= 2 s. Sans durée connue, le repli ne s'applique pas.
+    """
+    if ra >= MATCH_THRESHOLD and rt >= MATCH_THRESHOLD:
+        return True
+    if (ra >= MATCH_THRESHOLD and rt >= 70 and delta is not None
+            and delta <= DURATION_TOL):
+        return True
+    return False
+
+
+class LookupResult:
+    """Résultat tri-état d'une résolution de paroles.
+
+    FOUND        : un candidat valide a été retenu (lrc ou plain).
+    NOT_FOUND    : toutes les requêtes ont abouti (200) sans candidat valide,
+                   seul cas qui mérite d'être mis en cache comme "miss".
+    INCONCLUSIVE : au moins une requête a échoué (réseau, 429 épuisé, budget,
+                   exception) — rien n'est mis en cache, on retentera.
+    """
+
+    FOUND = "FOUND"
+    NOT_FOUND = "NOT_FOUND"
+    INCONCLUSIVE = "INCONCLUSIVE"
+
+    def __init__(self, status, lrc=None, raw=None, inst=False, plain=None, src=None):
+        self.status = status
+        self.lrc = lrc
+        self.raw = raw
+        self.inst = inst
+        self.plain = plain
+        self.src = src
+
+
+def last_timestamp(lrc):
+    """Dernier timestamp [mm:ss(.xx)] ou <mm:ss.xx> d'un LRC, en secondes.
+
+    Rend None si le texte est vide ou ne contient aucun timestamp.
+    """
+    if not lrc:
+        return None
+    last = None
+    for m in re.finditer(r"[\[<](\d{1,4}):(\d{1,2})(?:[.:](\d{1,3}))?[\]>]", lrc):
+        val = int(m.group(1)) * 60 + int(m.group(2))
+        frac = m.group(3)
+        if frac:
+            val += int(frac) / (10 ** len(frac))
+        if last is None or val > last:
+            last = val
+    return last
 
 def strip_timestamps(lrc):
     lines = []
@@ -60,6 +204,164 @@ def strip_timestamps(lrc):
         if line and not META_RE.match(line):
             lines.append(line)
     return "\n".join(lines).strip()
+
+_LYRIC_TS_RE = re.compile(r"^\s*[<\[]\d{1,4}:\d{1,2}(?:[.:]\d{1,3})?[>\]]")
+# [offset:] décale la synchro sans être une méta à jeter : on le conserve.
+_OFFSET_RE = re.compile(r"^\s*\[offset:", re.I)
+_MANUAL_META_RE = re.compile(r"^\s*\[(ar|ti|al|by|length|re|ve|tool):", re.I)
+
+
+def parse_manual_lyrics(text, duration=None):
+    """Analyse un LRC/texte collé manuellement.
+
+    Rend {"kind": "lrc"|"plain"|"empty", "lrc", "plain", "warnings"}.
+    LRC si au moins 50 % des lignes non vides hors méta portent un timestamp.
+    """
+    warnings = []
+    if text is None:
+        text = ""
+    text = text.replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return {"kind": "empty", "lrc": None, "plain": None, "warnings": warnings}
+
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    content = [ln for ln in lines
+               if not _MANUAL_META_RE.match(ln) and not _OFFSET_RE.match(ln)]
+    if not content:
+        return {"kind": "empty", "lrc": None, "plain": None, "warnings": warnings}
+
+    stamped = [ln for ln in content if _LYRIC_TS_RE.match(ln)]
+    if len(stamped) * 2 >= len(content):
+        lrc_lines = [ln for ln in lines if not _MANUAL_META_RE.match(ln)]
+        lrc = "\n".join(lrc_lines).strip()
+        last = last_timestamp(lrc)
+        if duration and last is not None and last > duration + 3:
+            warnings.append(
+                f"dernier timestamp {last:.1f}s > durée {duration:.1f}s + 3s")
+        return {"kind": "lrc", "lrc": lrc, "plain": strip_timestamps(lrc),
+                "warnings": warnings}
+
+    return {"kind": "plain", "lrc": None, "plain": text, "warnings": warnings}
+
+
+def _ttml_time(value):
+    """Convertit un temps TTML en secondes. None si le format est inconnu."""
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("s"):
+        s = s[:-1]
+    try:
+        if ":" in s:
+            parts = s.split(":")
+            if len(parts) == 3:
+                h, m, sec = parts
+                return int(h) * 3600 + int(m) * 60 + float(sec)
+            if len(parts) == 2:
+                m, sec = parts
+                return int(m) * 60 + float(sec)
+            return None
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _fmt_lrc_time(seconds):
+    """[mm:ss.xx], centièmes arrondis, minutes non plafonnées à 59."""
+    total = int(round(seconds * 100))
+    if total < 0:
+        total = 0
+    mm, rest = divmod(total, 6000)
+    ss, cs = divmod(rest, 100)
+    return f"[{mm:02d}:{ss:02d}.{cs:02d}]"
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def ttml_to_lrc(xml_text, duration=None):
+    """Convertit un TTML (paroliers Apple/Bini) en LRC.
+
+    Pure stdlib, sans dépendance. Rend None + log si le document est refusé
+    (DOCTYPE/ENTITY, > 2 Mo, illisible, ou sans ligne exploitable).
+    """
+    warnings = []
+    if not xml_text:
+        return None
+    if len(xml_text.encode("utf-8", "ignore")) > 2 * 1024 * 1024:
+        warnings.append("document TTML > 2 Mo")
+    if "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+        warnings.append("DOCTYPE/ENTITY interdit")
+    if warnings:
+        if _logger:
+            _logger("[WARN] ttml_to_lrc : " + "; ".join(warnings))
+        return None
+
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        if _logger:
+            _logger(f"[WARN] ttml_to_lrc : XML invalide ({e})")
+        return None
+
+    body_dur = None
+    rows = []
+    for el in root.iter():
+        name = _local(el.tag)
+        if name == "body" and body_dur is None:
+            body_dur = _ttml_time(el.attrib.get("dur"))
+        if name != "p":
+            continue
+        begin = _ttml_time(el.attrib.get("begin"))
+        if begin is None:
+            continue
+        parts = [el.text] if el.text else []
+
+        def walk(node):
+            for child in node:
+                role = None
+                for k, v in child.attrib.items():
+                    if _local(k) == "role":
+                        role = v
+                if role in ("x-bg", "x-translation", "x-roman"):
+                    if child.tail:
+                        parts.append(child.tail)
+                    continue
+                if child.text:
+                    parts.append(child.text)
+                walk(child)
+                if child.tail:
+                    parts.append(child.tail)
+
+        walk(el)
+        text = _WS_RE.sub(" ", "".join(p for p in parts if p)).strip()
+        if text:
+            rows.append((round(begin, 3), text))
+
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[0])
+    seen = set()
+    out = []
+    for begin, text in rows:
+        key = (begin, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_fmt_lrc_time(begin) + text)
+    if not out:
+        return None
+    lrc = "\n".join(out)
+    last = last_timestamp(lrc)
+    ref = duration if duration is not None else body_dur
+    if ref and last is not None and last > ref + 3:
+        if _logger:
+            _logger(f"[WARN] ttml_to_lrc : dernier {last:.1f}s > durée {ref:.1f}s + 3s")
+    return lrc
+
 
 def cache_key(artist, title, album=""):
     return f"{artist.strip().lower()}\x00{title.strip().lower()}\x00{album.strip().lower()}"
@@ -296,6 +598,7 @@ def _mark_dirty():
         _save_cache()
 
 def clear_cache():
+    global _cache_dirty, _dirty_count
     with _save_lock, _cache_lock:
         _cache.clear()
         _cache_dirty = False

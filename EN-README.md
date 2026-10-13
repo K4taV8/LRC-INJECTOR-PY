@@ -69,9 +69,11 @@ The script specifically targets the `FLAC` format and relies on two Vorbis Comme
 > - ` 💉 ` **START** ︲ Inject missing lyrics on a folder or a `.flac` file.
 > - ` 🔍 ` **CHECK**︲ Audit + automatic repair of tags that are present but incomplete.
 
-* ` 🌐 `︲**Fetching via the LRCLIB API** : direct query (`artist`/`track`/`album`) with the **track duration** (`duration`, read from local FLAC tags — official LRCLIB recommendation : ±2 s matching, fewer false positives; `duration` outside the 1–3600 s range is dropped and reported), then automatic fallback to the search endpoint with several query variants (exact name, title only, ASCII transliterated version, structured `track_name`+`artist_name`) where the local duration also breaks ties — all within a bounded budget (12 s).
+* ` 🌐 `︲**Fetching via the LRCLIB API** : direct query (`artist`/`track`/`album`) with the **track duration** (`duration`, read from local FLAC tags — official LRCLIB recommendation : ±2 s matching, fewer false positives; `duration` outside the 1–3600 s range is dropped and reported), then a **cascade** `/api/get` → `/api/get` without album (only if an album was supplied, duration kept) → `/api/search` with several query variants (exact name, title only, ASCII transliterated version, structured `track_name`+`artist_name`). The search fallback is bounded (12 s, **excluding rate-limit waits** — each request is timed, not the throttling) and stops early once a reliable synced candidate is found.
 
-* ` 🧠 `︲**Fuzzy similarity validation** (`rapidfuzz`) : API results are compared against the local file's artist and title (threshold `85%`) before injection, to filter out false positive.
+* ` 🧩 `︲**Three-state resolution** : each lookup returns `FOUND`, `NOT_FOUND`, or `INCONCLUSIVE`. Only a clean `NOT_FOUND` (every request answered `200`, no valid candidate) writes a negative cache entry; a network error, a `429`, or a timeout yields `INCONCLUSIVE` and caches nothing, so the track is retried later instead of being masked as "missing".
+
+* ` 🧠 `︲**Unified fuzzy similarity** (`rapidfuzz`) : a single `similarity()` function (`core.py`) backs both `match()` and search scoring. Normalization lowercases, folds accents, drops non-significant markers (`(Explicit)`, `- Remastered 2012`, `feat/ft` to the end), and treats `&` as `and`; significant version markers (`live`, `acoustic`, `demo`, `remix`, `unplugged`) are **never** dropped, so a version present on only one side blocks the match. Artist names are split on `; , & feat` to take the best pairing; `token_set_ratio` is banned on titles ("Love" must not match "Love Me Do"). A **two-tier threshold** applies: `ra ≥ 85` and `rt ≥ 85` (standard), or `ra ≥ 85`, `rt ≥ 70` with a duration gap `≤ 2 s`; candidates are ranked by duration first, then `ra + rt`. The retained LRC is validated against the local duration (last timestamp > duration + 3 s → rejected).
 
 * ` 🎼 `︲**Dual synchronized/plain injection** : every processed track receives both `LYRICS` (with timestamps) and `UNSYNCEDLYRICS` (timestamps removed), generated from the same source.
 
@@ -79,7 +81,11 @@ The script specifically targets the `FLAC` format and relies on two Vorbis Comme
 
 * ` 🩹 `︲**Repairing CHECK mode** : if a file has `LYRICS` but not `UNSYNCEDLYRICS` (or the reverse), the tool regenerates the missing tag without a new network request when possible (local derivation by stripping timestamps).
 
-* ` 💾 `︲**Persistent local cache** (`lrc_cache.json`) : every artist/title pair already resolved (found, not found, or instrumental) is cached to avoid re-querying the API on later runs. Periodic writes (every 200 changes) plus a save on exit. **Two distinct TTLs** : a *not found* track (`404`) is retried after **3 days** — LRCLIB picks missing tracks up in the background, so a miss is not final — while a track *found but without synced lyrics* is kept for **30 days**. Successful lookups never expire.
+* ` 💾 `︲**Persistent local cache** (`lrc_cache.json`) : every artist/title pair already resolved (found, not found, or instrumental) is cached to avoid re-querying the API on later runs. Periodic writes (every 200 changes) plus a save on exit. **Two distinct TTLs** : a *not found* track (`404`) is retried after **3 days** — LRCLIB picks missing tracks up in the background, so a miss is not final — while a track *found but without synced lyrics* is kept for **7 days**, so a synced version appearing later can be picked up. Successful lookups never expire. `CHECK` mode re-queries plain-only files without being blocked by the cache.
+
+* ` 🖊️ `︲**Manual injection** : a `MANUAL` button (disabled during a batch) opens a modal where you paste a LRC/plain text for a chosen track. A LRC (≥ 50 % timestamped lines) is written to `LYRICS` + `UNSYNCEDLYRICS`; otherwise the text goes to `UNSYNCEDLYRICS` only, after confirmation. After a batch the button reads `MANUAL (N)` and walks through the N failures (`miss`/`reject`/`retry`) one by one.
+
+* ` 🅱️ `︲**BiniLyrics fallback (opt-in)** : an Options checkbox (not persisted, off by default) queries the [BiniLyrics API](https://lyrics-api.binimum.org/) (JSON + TTML) **only** when LRCLIB returns `NOT_FOUND` or a plain-only result — never on `INCONCLUSIVE`. Query order: `isrc=` (if the file has the tag), then `track+artist+duration+album`, then `track+artist+duration`, then `track+artist`. TTML is converted to LRC by `core.ttml_to_lrc()` (stdlib only) and cached under a `bini:` prefix (same schema/TTLs). Disabled until the owner validates its behaviour on a real batch.
 
 * ` ⚙️ `︲**Multithreaded processing** : `ThreadPoolExecutor` with an adjustable thread count in the interface (1–32 for injection, 1–16 for checking).
 
@@ -179,7 +185,7 @@ $env:LRC_LOG_FILE = "C:\path\to\lrc-inject.log"
 python lrc-inject.py
 ```
 
-**6️⃣ Run the tests (45 tests, ~ 2 s).**
+**6️⃣ Run the tests (81 tests, ~ 2 s).**
 
 ```bash
 python test_core.py
@@ -219,7 +225,14 @@ python test_core.py
 |--------|--------|
 | `START` | Injects missing lyrics on files without `LYRICS`/`UNSYNCEDLYRICS`. |
 | `CHECK & REPAIR` | Audits already-tagged files and repairs incomplete tags. |
+| `MANUAL` | Manual injection of pasted LRC, one file at a time (see below). |
 | `STOP` | Interrupts the current processing. |
+
+---
+
+**Manual injection (`MANUAL`)**
+
+The `MANUAL` button is disabled during a batch. After a run it reads `MANUAL (N)`, where `N` is the number of failures (`miss`/`reject`/`retry`) from the last batch: each click opens the next file in the queue. With an empty queue it takes the source `.flac` if that is a file, otherwise it opens a file picker. The modal shows the read-only `artist - title (duration)` and whether `LYRICS`/`UNSYNCEDLYRICS` already exist, then a text area to paste the content: a LRC (≥ 50 % timestamped lines) is written to `LYRICS` + `UNSYNCEDLYRICS`; otherwise the text goes to `UNSYNCEDLYRICS` only after confirmation. An existing tag or a warning (last timestamp past duration + 3 s) triggers an overwrite confirmation.
 
 ---
 
@@ -228,9 +241,11 @@ python test_core.py
 Every processed track generates a line prefixed by its status:
 
 ```
-[OK]        Lyrics already present / injection succeeded
-[REJECT]    Result found but insufficient similarity with the local tag
-[MISS]      No result found on LRCLIB
+[OK]        Synced lyrics injected (LYRICS + UNSYNCEDLYRICS)
+[PLAIN]     Plain text injected (UNSYNCEDLYRICS only)
+[REJECT]    Result found but insufficient similarity (candidate + scores shown)
+[MISS]      No result, every request answered 200 — negative cache entry written
+[RETRY]     Inconclusive resolution (network/429/timeout) — nothing cached, retry later
 [SKIP]      File ignored (already complete, or missing artist/title)
 [INST]      Track identified as instrumental
 [ERROR]     File read/write error
@@ -239,7 +254,7 @@ Every processed track generates a line prefixed by its status:
 [REPAIRED]  Missing tag regenerated (CHECK mode)
 ```
 
-A concise numeric summary (`STATS`) is displayed at the end of the processing.
+A concise numeric summary (`STATS`) is displayed at the end of the processing, with a dedicated `BINI` counter for the BiniLyrics fallback.
 
 ---
 
@@ -263,13 +278,14 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
   - **On `429`/`503`**: `Retry-After` is honored, the effective rate is **halved** (2 req/s floor) and the request is retried up to 3 times. After 25 healthy responses in a row the rate climbs back by 1 req/s steps — **never above the slider**.
   - A transient error (`429`, `5xx`) is **never cached**: the track will be retried on the next run. A `400`, on the other hand, is an invalid request: it is reported as-is in the log, with no fallback triggered.
   - LRCLIB being a free service, the slider lets you stay cautious on a large library. The [official docs](https://lrclib.net/docs) recommend 200–500 ms between requests (~2–5 req/s) and threaten a temporary ban if `Retry-After` is ignored.
-* ` 🪪 `︲**User-Agent** : set to `LRC-Injekt/1.0.1 (+https://github.com/LRC-Injekt)` — mandatory per the LRCLIB documentation to avoid a ban.
+* ` 🪪 `︲**User-Agent** : `lrc-injector/1.2 (https://github.com/K4taV8/LRC-INJECTOR-PY)` is sent on every request — mandatory per the LRCLIB documentation to avoid a ban.
 * ` ⏱️ `︲**Track duration sent**: the FLAC `length` tag (when available) is passed as `duration` to the API — ±2 s matching as recommended, which filters out false positives.
-* ` 💾 ` **Cache** : `lrc_cache.json` file, generated automatically next to the script (versioned schema `v:1`, backward-compatible — an unknown schema is ignored). **3-day TTL on "not found" entries** (`miss`, e.g. `404`) and **30 days on "found without synced lyrics"** (`no_sync`): both expire on their own and trigger a retry. Existing `v:1` caches are picked up as-is, a `no_sync` entry without `plainLyrics` being reinterpreted as a `miss`. No custom path option so far.
-* ` 🎯 `︲**Similarity threshold** : hardcoded to `85%` (`rapidfuzz.fuzz.ratio`) in the source code, not exposed in the interface.
-
-* ` ⏱️ `︲**Duration as tie-breaker** : when falling back to `/api/search`, the local duration feeds the score (bonus within 2 s, decreasing penalty beyond) — the same criterion `/api/get` uses, without which a live or a remaster too often wins. Structured `track_name`+`artist_name` search completes the three `q` queries.
+* ` 💾 ` **Cache** : `lrc_cache.json` file, generated automatically next to the script (versioned schema `v:1`, backward-compatible — an unknown schema is ignored). **3-day TTL on "not found" entries** (`miss`, e.g. `404`) and **7 days on "found without synced lyrics"** (`no_sync`): both expire on their own and trigger a retry. Only a clean `NOT_FOUND` writes a `miss`; an `INCONCLUSIVE` (network/429/timeout) writes nothing. `CHECK` mode re-queries plain-only files without being blocked by the cache. Existing `v:1` caches are picked up as-is, a `no_sync` entry without `plainLyrics` being reinterpreted as a `miss`. No custom path option so far.
+* ` 🎯 `︲**Unified similarity threshold** : a single `similarity()` function (`core.py`) is used by both `match()` and search scoring. Normalization lowercases, folds accents, drops non-significant markers (`(Explicit)`, `- Remastered 2012`, `feat/ft` to the end) and treats `&` as `and`; significant version markers (`live`, `acoustic`, `demo`, `remix`, `unplugged`) are never dropped. Artists are split on `; , & feat` for the best pairing; `token_set_ratio` is banned on titles.
+* ` 🪜 `︲**Two-tier threshold + duration** : a candidate passes if `ra ≥ 85` and `rt ≥ 85` (standard), or `ra ≥ 85`, `rt ≥ 70` with a duration gap `≤ 2 s` (fallback). Ranking is by duration first (gap ≤ 2 s preferred), then `ra + rt`; a candidate beyond 2 s is only a last resort, with an explicit `[WARN]`. The retained LRC is also validated against the duration (last timestamp > local duration + 3 s → rejected).
+* ` 🅱️ `︲**BiniLyrics fallback (off by default)** : an Options checkbox (not persisted). It queries the [BiniLyrics API](https://lyrics-api.binimum.org/) (JSON + TTML) **only** when LRCLIB returns `NOT_FOUND` or a plain-only result, never on `INCONCLUSIVE`. Order: `isrc=` (if the FLAC has the tag), then `track+artist+duration+album`, then `track+artist+duration`, then `track+artist`. TTML is converted by `core.ttml_to_lrc()`; cache prefixed `bini:` (same `v:1` schema and TTLs). Not enabled until the owner validates it on a real batch.
 * ` 📄 `︲**File log (optional)** : set the `LRC_LOG_FILE` environment variable to a `.log` file to keep a persistent trace (appended in batches) in addition to the window.
+* ` 🐞 `︲**Verbose mode (optional)** : `LRC_DEBUG=1` logs, per request, the URL, params, HTTP status and result count; and per search candidate, `artistName`, `trackName`, `duration`, `ra`, `rt`, the duration gap and the `accept`/`reject` decision with its reason. The tool to diagnose a false "not found".
 
 ---
 
@@ -281,20 +297,24 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 > [!IMPORTANT]
 > The project is structured as **pure core + interface** :
 >
-> - `core.py` — pure logic **with no Tkinter**, importable and testable on its own: `clean()` / `match()` / `strip_timestamps()` / `_parse_result()`, `build_get_params()` (parameter validation), `entry_expired()` (cache TTL), `RateLimiter` (token bucket + `429` fallback), `scaled_size()` / `opening_geometry()` (real-pixel sizing and centering), `resolve_asset()` (optional assets), disk cache.
+> - `core.py` — pure logic **with no Tkinter**, importable and testable on its own: `clean()` / `fold()` / `similarity()` / `match()` / `meets_threshold()` (two-tier threshold), `strip_timestamps()` / `_parse_result()` / `last_timestamp()` / `parse_manual_lyrics()` / `ttml_to_lrc()`, `LookupResult` (three-state FOUND/NOT_FOUND/INCONCLUSIVE), `build_get_params()` (parameter validation), `entry_expired()` (cache TTL), `RateLimiter` (token bucket + `429` fallback), `scaled_size()` / `opening_geometry()` (real-pixel sizing and centering), `resolve_asset()` (optional assets), disk cache.
 > - `lrc-inject.py` — CustomTkinter interface + network/threads orchestration.
-> - `test_core.py` — assert-based test suite (45 tests, `python test_core.py`).
+> - `providers/bini.py` — BiniLyrics network client (JSON + TTML), isolated and imported only when its checkbox is ticked. Its own `RateLimiter` (2 req/s default), `Retry-After` honored, same `User-Agent`.
+> - `test_core.py` — assert-based test suite (81 tests, `python test_core.py`).
 > - `Logo.png` — application logo (title bar, taskbar, header). Optional: a missing file does not prevent startup.
 
 | Functional block                     | Role                                                                |
 |--------------------------------------|---------------------------------------------------------------------|
 | `get_session()`                      | Shared `requests` session with HTTP retry strategy.                 |
 | `_load_cache()` / `_save_cache()` / `_mark_dirty()`    | Disk cache management (`lrc_cache.json`) — `core.py`, periodic flush, `v:1` schema. |
-| `fetch_lrc()` / `_search_fallback()` / `_parse_result()` | Lyrics fetching via the LRCLIB API (direct query + budgeted search fallback, best candidate). |
-| `clean()` / `match()` / `strip_timestamps()` | String normalization, fuzzy comparison, `LYRICS` → `UNSYNCEDLYRICS` derivation — `core.py`. |
-| `build_get_params()` / `entry_expired()` / `resolve_asset()` | Pure validations — `core.py`: `/api/get` query conforming to the LRCLIB docs (empty params purged, `duration` bounded to 1–3600), cache TTL (3 d / 30 d), optional asset. |
+| `fetch_lrc_ex()` / `fetch_lrc()` / `_try_get()` / `_search_fallback()` / `_parse_result()` | Lyrics fetching via the LRCLIB API: `/api/get` cascade (full → without album) then budgeted search, with a **three-state status**. `fetch_lrc()` remains the backward-compatible 3-value wrapper. |
+| `_bini_lookup()` / `providers/bini.py` | Opt-in BiniLyrics fallback: `bini:`-prefixed cache, order `isrc → track/artist/album → …`, TTML download converted to LRC. |
+| `clean()` / `fold()` / `similarity()` / `match()` / `meets_threshold()` / `strip_timestamps()` | String normalization, unified similarity, two-tier threshold, `LYRICS` → `UNSYNCEDLYRICS` derivation — `core.py`. |
+| `build_get_params()` / `entry_expired()` / `resolve_asset()` | Pure validations — `core.py`: `/api/get` query conforming to the LRCLIB docs (empty params purged, `duration` bounded to 1–3600), cache TTL (3 d / 7 d), optional asset. |
 | `scaled_size()` / `opening_geometry()` | Real-pixel startup size and exact centering — `core.py` (DPI conversion, physical-pixel position, frame border). |
-| `_score_entry()` / `_search_queries()` | `/api/search` fallback: local duration as the deciding factor (±2 s) + structured `track_name`+`artist_name` query. |
+| `_score_entry()` / `_rank()` / `_search_queries()` | `/api/search` fallback: two-tier threshold (`meets_threshold`), ranking by duration then `ra + rt`, structured `track_name`+`artist_name` query. |
+| `parse_manual_lyrics()` / `ttml_to_lrc()` / `last_timestamp()` | Pure `core.py`: pasted-LRC analysis (LRC/plain/empty, BOM/CRLF, `[offset:]`, enhanced timestamps) and TTML → LRC conversion (stdlib `xml.etree` only). |
+| `manual_inject()` / `_open_manual_window()` / `_set_failed_paths()` | Manual mode: modal injection window and failure queue (`miss`/`reject`/`retry`) of the last batch. |
 | `_set_app_user_model_id()` / `_load_logo()` | App identity and logo: `AppUserModelID` before the window (taskbar icon instead of the Py logo), `Logo.png` in the title bar and header. |
 | `_collect_flac()`                    | Recursive scan + inode-based deduplication (hardlinks/duplicates).  |
 | `process_file()` / `run()`           | **Injection** mode logic (START) on a file / a batch.               |
@@ -334,7 +354,7 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 
 * ` 🪣 `︲**Shared token bucket** : smooths the flow under a lock, ceiling adjustable from 1 to 25 req/s — a steady, burst-free rhythm for LRCLIB.
 
-* ` 🎯 `︲**Budgeted fallback search** (12 s max) : the best candidate is selected by combined scoring (artist ratio + title ratio) without ever exceeding the total budget.
+* ` 🎯 `︲**Budgeted fallback search** (12 s max, **excluding rate-limit waits**: each request is timed, not the throttling) : the best candidate is ranked by duration first, then `ra + rt`, with early exit as soon as a reliable synced candidate is found. An exhausted budget returns `INCONCLUSIVE` (nothing cached) rather than a false `MISS`.
 
 * ` 📊 `︲**Throttled progress updates** : the bar refreshes only ~200 steps per batch (not a `set()` per file) — the Tkinter loop stays smooth on large volumes.
 
@@ -349,11 +369,11 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 |--------|-----------|
 | **In-place FLAC writing** (`audio.save()` without temp file) | mutagen 1.46+ does not support `save(tmp)` to a new file — it checks the FLAC header of the output file, which fails on an empty one. In-place `save()` writes the new Vorbis tags at the head of the file. If the Vorbis block changes size (systematically the case with `LYRICS` + `UNSYNCEDLYRICS`), `resize_bytes` physically shifts the audio data on disk. A crash/power loss *during this shift* can truncate the audio, not just the tags. This is very unlikely (a few-ms window per file), but documented for transparency. For maximum safety, back up your library before batch processing. |
 | **Broad `except Exception`** | GUI application : a silent failure logged with context is better than an unhandled traceback that closes the window. Every error is logged with its context. |
-| **Extracted pure core (`core.py`)** | The pure logic (cleaning, matching, parsing, cache, rate limiter, geometry) was extracted from `lrc-inject.py` (GUI + orchestration) — now unit-testable (45 tests). |
+| **Extracted pure core (`core.py`)** | The pure logic (cleaning, unified similarity, parsing, cache, rate limiter, geometry, TTML) was extracted from `lrc-inject.py` (GUI + orchestration) — now unit-testable (81 tests). The network BiniLyrics client lives in `providers/bini.py`, isolated. |
 | **`daemon=True` on workers** | The `join(timeout=30)` in `on_close()` leaves time to finish. If the timeout expires, the thread is killed ; the in-place write can leave a file mid-shift in an unstable state. Ideally, wait for the processing to finish before closing the app. |
-| **No-TTL cache** | The `no_sync` and `inst` entries are permanent; "not found" entries expire after **30 days**. The user has a `Clear Cache` button to start from scratch if needed. |
+| **Permanent cache entries** | Injected lyrics, instrumental answers and successful lookups are cached forever. Only negative/incomplete entries carry a TTL (see below). The user has a `Clear Cache` button to start from scratch if needed. |
 | **Single smoothed API rate** | No more unlimited bursts: a shared token bucket capped by a slider (1 → 25 req/s, 25 by default). On `429`/`503`, `Retry-After` is honored, the rate is halved then climbed back by steps, never above the slider. A transient error is never cached. |
-| **Split cache TTLs** | "Not found" entries (`miss`, e.g. `404`) expire after **3 days** (LRCLIB picks missing tracks up in the background); "found without synced lyrics" (`no_sync`) after **30 days**; lyrics, instrumental answers and successful lookups stay forever. `Clear Cache` button to start from zero. |
+| **Split cache TTLs (no contradiction)** | "Not found" entries (`miss`, e.g. `404`) expire after **3 days** (LRCLIB picks missing tracks up in the background); "found without synced lyrics" (`no_sync`) after **7 days**, so a synced version appearing later can be picked up; lyrics, instrumental answers and successful lookups stay forever. Only a clean `NOT_FOUND` writes a `miss`; an `INCONCLUSIVE` result writes nothing. `Clear Cache` button to start from zero. |
 | **`_save_flac(audio, path)` ignores `path`** | Signature kept for compatibility. `audio.save()` always uses the file's internal path. |
 
 ---
@@ -371,7 +391,8 @@ A concise numeric summary (`STATS`) is displayed at the end of the processing.
 * **requests** + **urllib3** : HTTP calls to the LRCLIB API, with retry handling.
 * **customtkinter** also brings in **darkdetect** and **packaging** transitively.
 * **ctypes** (Windows only) : DPI awareness and dark title bar via `SetProcessDpiAwarenessContext` / `DwmSetWindowAttribute`.
-* **LRCLIB API** ([`🌐`](https://lrclib.net/)) : source of synchronized lyrics.
+* **LRCLIB API** ([`🌐`](https://lrclib.net/)) : primary source of synchronized lyrics (direct query + search).
+* **BiniLyrics API** ([`🌐`](https://lyrics-api.binimum.org/)) : optional fallback source (JSON + TTML), converted to LRC by `core.ttml_to_lrc()` (`xml.etree.ElementTree`, no added dependency).
 * **concurrent.futures (ThreadPoolExecutor)** : processing parallelization.
 
 ---
